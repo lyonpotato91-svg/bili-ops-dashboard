@@ -13,8 +13,8 @@ st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
 # =========================
 # Constants
 # =========================
-BASELINE_PROJECT = "__BASELINE__"
-DB_PATH = "bili_dashboard.db"
+BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不出现在项目归档/筛选里
+DB_PATH = "bili_dashboard.db"           # SQLite文件（持久化）
 TABLE_NAME = "videos"
 
 # =========================
@@ -180,7 +180,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["project", "title", "owner_name"]:
         if col not in df.columns:
             df[col] = ""
-
     for col in EXTRA_COLS:
         if col not in df.columns:
             df[col] = ""
@@ -218,7 +217,8 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================
-# Global performance label (KOL recent baseline)
+# Global performance label (NOT time-based)
+# Baseline = the UP's latest N videos in DB (by pubdate; fallback to fetched_at)
 # =========================
 def perf_label(value: float, baseline_values: np.ndarray, ratio_hi: float, ratio_lo: float, min_n: int) -> str:
     baseline_values = baseline_values[~np.isnan(baseline_values)]
@@ -232,21 +232,25 @@ def perf_label(value: float, baseline_values: np.ndarray, ratio_hi: float, ratio
         return "低于预期"
     return "正常发挥"
 
+def _sort_owner_hist(df_owner: pd.DataFrame) -> pd.DataFrame:
+    g = df_owner.copy()
+    # 优先 pubdate 排序，缺失用 fetched_at 兜底
+    g["__sort_time"] = g["pubdate"]
+    missing = g["__sort_time"].isna()
+    g.loc[missing, "__sort_time"] = g.loc[missing, "fetched_at"]
+    g = g[pd.notna(g["__sort_time"])].sort_values("__sort_time", ascending=False)
+    return g
+
 def build_owner_cache(df_all: pd.DataFrame) -> dict:
     cache = {}
     for up, g in df_all.groupby("owner_name"):
-        g2 = g.copy()
-        g2 = g2[pd.notna(g2["pubdate"])].sort_values("pubdate", ascending=False)
-        cache[up] = g2
+        cache[up] = _sort_owner_hist(g)
     return cache
 
-def recent_baseline(df_owner_sorted_desc: pd.DataFrame, current_bvid: str, col: str, window_n: int,
-                    exclude_projects: set | None = None) -> np.ndarray:
-    if df_owner_sorted_desc is None or df_owner_sorted_desc.empty:
+def recent_baseline(owner_hist_desc: pd.DataFrame, current_bvid: str, col: str, window_n: int) -> np.ndarray:
+    if owner_hist_desc is None or owner_hist_desc.empty:
         return np.array([], dtype=float)
-    h = df_owner_sorted_desc[df_owner_sorted_desc["bvid"] != current_bvid]
-    if exclude_projects:
-        h = h[~h["project"].isin(exclude_projects)]
+    h = owner_hist_desc[owner_hist_desc["bvid"] != current_bvid]
     if h.empty:
         return np.array([], dtype=float)
     return h.head(window_n)[col].astype(float).to_numpy()
@@ -318,9 +322,9 @@ def fetch_recent_bvids_by_mid(mid: int, n: int = 20) -> list[str]:
 # =========================
 st.sidebar.title("📊 B站运营Dashboard")
 
-st.sidebar.markdown("#### 全局“发挥评价”口径")
-baseline_window_n = st.sidebar.slider("KOL近期基准：取最近N条视频", 10, 60, 20, step=5)
-baseline_min_n = st.sidebar.slider("最低样本数（不足则显示“基准不足”）", 1, 20, 6, step=1)
+st.sidebar.markdown("#### 全局“发挥评价”口径（按KOL自身历史，不按时间）")
+baseline_window_n = st.sidebar.slider("基准：取该KOL最近N条视频（按发布时间/抓取时间排序）", 10, 60, 20, step=5)
+baseline_min_n = st.sidebar.slider("最低样本数（只与“库内条数”有关，不与时间有关）", 1, 20, 6, step=1)
 
 st.sidebar.divider()
 
@@ -450,6 +454,7 @@ else:
 # =========================
 df_db = load_all_rows()
 df_db = normalize_df(df_db) if not df_db.empty else df_db
+
 st.title("B站日常运营数据 Dashboard")
 if df_db.empty:
     st.info("数据库为空：请在左侧采集或导入。")
@@ -463,6 +468,7 @@ df_db = compute_metrics(df_db)
 projects = sorted([p for p in df_db["project"].dropna().unique().tolist()
                    if str(p).strip() != "" and p != BASELINE_PROJECT])
 sel_projects = st.sidebar.multiselect("选择项目（筛选展示）", projects, default=projects if projects else None)
+
 df_main = df_db[df_db["project"] != BASELINE_PROJECT].copy()
 df_f = df_main[df_main["project"].isin(sel_projects)].copy() if sel_projects else df_main.copy()
 
@@ -481,7 +487,7 @@ c3.metric("平均互动率", f"{df_f['engagement_rate'].mean()*100:.2f}%")
 c4.metric("深度信号占比(币+藏/互动)", f"{df_f['deep_signal_ratio'].mean()*100:.1f}%")
 
 # =========================
-# Cross project comparison
+# Cross project comparison + Quadrant (RESTORED)
 # =========================
 st.subheader("跨项目对比（项目之间谁更强、谁更稳）")
 proj_rows = []
@@ -494,6 +500,7 @@ for proj, g in df_f.groupby("project"):
 
     er_med = float(g2["engagement_rate"].median())
     deep_med = float(g2["deep_signal_ratio"].median())
+
     er_q1 = float(g2["engagement_rate"].quantile(0.25))
     er_q3 = float(g2["engagement_rate"].quantile(0.75))
     er_iqr = er_q3 - er_q1
@@ -515,7 +522,9 @@ for proj, g in df_f.groupby("project"):
         "Top1播放贡献": top1_share,
         "Top3播放贡献": top3_share,
     })
+
 proj_df = pd.DataFrame(proj_rows).sort_values("总播放", ascending=False)
+
 st.dataframe(
     proj_df.assign(**{
         "互动率中位数": (proj_df["互动率中位数"]*100).map(lambda x: f"{x:.2f}%"),
@@ -527,6 +536,27 @@ st.dataframe(
     use_container_width=True,
     height=260
 )
+
+st.markdown("**项目四象限（X=互动率中位数，Y=深度信号中位数）**")
+if len(proj_df) >= 2:
+    x_med = float(proj_df["互动率中位数"].median())
+    y_med = float(proj_df["深度信号中位数"].median())
+
+    fig_q = px.scatter(
+        proj_df,
+        x="互动率中位数",
+        y="深度信号中位数",
+        size="总播放",
+        text="project",
+        hover_data=["视频数","UP数","总播放","Top1播放贡献","Top3播放贡献","互动率波动(IQR)"],
+    )
+    fig_q.add_vline(x=x_med, line_dash="dash")
+    fig_q.add_hline(y=y_med, line_dash="dash")
+    fig_q.update_traces(textposition="top center")
+    fig_q.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
+    st.plotly_chart(fig_q, use_container_width=True)
+else:
+    st.info("项目数不足（<2）时，四象限对比意义不大。")
 
 # =========================
 # Project table
@@ -545,7 +575,7 @@ st.dataframe(df_f[show_cols].sort_values("view", ascending=False), use_container
 # =========================
 # Top/Bottom
 # =========================
-st.subheader("Top / Bottom 深挖（含KOL近期基准判断）")
+st.subheader("Top / Bottom 深挖（含KOL自身基准判断）")
 for proj in sel_projects if sel_projects else projects:
     d = df_f[df_f["project"] == proj].sort_values("view", ascending=False)
     if d.empty:
@@ -587,23 +617,25 @@ insights = [
 st.write("\n".join(insights))
 
 # =========================================================
-# KOL module (critical improvements)
+# KOL module (optimized)
+# - No "use-case suggestion"
+# - Baseline diagnosis based on DB count only
 # =========================================================
 st.divider()
-st.subheader("KOL合作资料库（独立模块：自动补齐基准，解决“基准不足”）")
+st.subheader("KOL合作资料库（独立模块：对比该KOL自身历史表现，不按时间）")
 
 with st.expander("KOL模块设置", expanded=False):
     collab_projects = st.multiselect("哪些项目算合作项目", projects, default=sel_projects if sel_projects else projects)
-    fetch_n = st.slider("补齐基准：每个KOL抓取最近N条公开视频", 10, 60, baseline_window_n, step=5)
+    fetch_n = st.slider("补齐基准：每个KOL抓取最近N条公开视频写入库", 10, 60, baseline_window_n, step=5)
     sleep_sec = st.slider("抓取间隔（防限流）", 0.2, 2.0, 0.8, step=0.1)
 
 cA, cB, cC = st.columns([1,1,2])
 with cA:
-    btn_fill_all = st.button("🧲 一键补齐所有合作KOL的近期基准（强烈推荐）")
+    btn_fill_all = st.button("🧲 一键补齐所有合作KOL的历史视频到库（推荐）")
 with cB:
-    btn_build_kol = st.button("📚 生成KOL资料库")
+    btn_build_kol = st.button("📚 生成KOL对比表")
 with cC:
-    st.caption("提示：先点“补齐基准”，再生成资料库，否则很多UP会显示基准不足。")
+    st.caption("注意：基准不足只表示“库里该UP视频条数不够”，和TA是否近期更新无关。先补齐视频再生成。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
@@ -654,51 +686,50 @@ if collab_projects:
             df_new["pubdate"] = pd.to_datetime(df_new["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             df_new["fetched_at"] = pd.to_datetime(df_new["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             upsert_rows(df_new)
-            st.success(f"已补齐并保存基准样本：新增 {len(rows_new)} 条")
+            st.success(f"已补齐并保存：新增 {len(rows_new)} 条")
             st.rerun()
         else:
-            st.warning("本次未新增基准样本（可能已存在/限流/接口波动）。")
+            st.warning("本次未新增（可能已存在/限流/接口波动）。")
 
-    # ---- Diagnosis: baseline availability ----
-    st.markdown("**KOL基准诊断（现在到底缺不缺基准）**")
-    df_all = df_db.copy()
+    # ---- Diagnosis: baseline availability (DB count only) ----
+    st.markdown("**KOL基准诊断（只看库里该UP的视频条数是否足够）**")
     diag = []
     for up, g in collab_df.groupby("owner_name"):
-        # baseline candidates: __BASELINE__ + 非合作项目
-        base = df_all[(df_all["owner_name"] == up) & (~df_all["project"].isin(collab_projects))].copy()
-        base = pd.concat([base, df_all[(df_all["project"] == BASELINE_PROJECT) & (df_all["baseline_for"] == up)]], ignore_index=True)
-        base = base.drop_duplicates(subset=["bvid"], keep="last")
+        owner_all = df_db[df_db["owner_name"] == up].copy()
+        owner_all = _sort_owner_hist(owner_all)
+        available = int(min(len(owner_all[owner_all["bvid"].notna()]), baseline_window_n))
         diag.append({
             "KOL/UP主": up,
-            "合作视频数": int(len(g)),
-            "可用基准数": int(len(base)),
-            "状态": "OK" if len(base) >= baseline_min_n else f"基准不足(<{baseline_min_n})",
+            "库内视频总数": int(len(owner_all)),
+            f"可用基准数(取最近{baseline_window_n})": available,
+            "状态": "OK" if available >= baseline_min_n else f"基准不足(<{baseline_min_n})",
             "是否有owner_mid": "有" if g["owner_mid"].notna().any() else "无"
         })
-    diag_df = pd.DataFrame(diag).sort_values(["状态","可用基准数"], ascending=[True, False])
+    diag_df = pd.DataFrame(diag).sort_values(["状态","库内视频总数"], ascending=[True, False])
     st.dataframe(diag_df, use_container_width=True, height=280)
 
-    # ---- Build KOL library ----
+    # ---- Build KOL compare table (collab vs own baseline) ----
     if btn_build_kol:
         df_all_m = compute_metrics(df_db.copy())
         rows = []
 
         for up, g_collab in df_all_m[df_all_m["project"].isin(collab_projects)].groupby("owner_name"):
-            # baseline pool = 非合作 + __BASELINE__
-            base_pool = df_all_m[(df_all_m["owner_name"] == up) & (~df_all_m["project"].isin(collab_projects))].copy()
-            base_pool = pd.concat([base_pool, df_all_m[(df_all_m["project"] == BASELINE_PROJECT) & (df_all_m["baseline_for"] == up)]], ignore_index=True)
+            owner_all = df_all_m[df_all_m["owner_name"] == up].copy()
+            owner_all = _sort_owner_hist(owner_all)
+
+            # baseline = owner's latest N videos excluding current合作项目的视频（更像“平时水平”）
+            base_pool = owner_all[~owner_all["project"].isin(set(collab_projects))].copy()
+            # 再加上 __BASELINE__（本质也是该UP的平时视频）
+            base_pool = pd.concat([base_pool, owner_all[owner_all["project"] == BASELINE_PROJECT]], ignore_index=True)
             base_pool = base_pool.drop_duplicates(subset=["bvid"], keep="last")
+            base_pool = _sort_owner_hist(base_pool).head(baseline_window_n)
 
-            # recent baseline = latest N in baseline_pool
-            base_pool = base_pool[pd.notna(base_pool["pubdate"])].sort_values("pubdate", ascending=False)
-            recent = base_pool.head(baseline_window_n)
-
-            if len(recent) < baseline_min_n:
+            if len(base_pool) < baseline_min_n:
                 continue
 
-            base_view = float(recent["view"].median())
-            base_er = float(recent["engagement_rate"].median())
-            base_deep = float(recent["deep_signal_ratio"].median())
+            base_view = float(base_pool["view"].median())
+            base_er = float(base_pool["engagement_rate"].median())
+            base_deep = float(base_pool["deep_signal_ratio"].median())
 
             collab_view = float(g_collab["view"].median())
             collab_er = float(g_collab["engagement_rate"].median())
@@ -709,37 +740,53 @@ if collab_projects:
             deep_lift = (collab_deep / base_deep - 1.0) if base_deep > 0 else np.nan
 
             tags = []
-            if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升型")
-            if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("强互动引爆")
-            if not np.isnan(deep_lift) and deep_lift >= 0.10: tags.append("价值沉淀型")
-            if not tags: tags.append("常规表现")
+            if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升")
+            if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("互动增强")
+            if not np.isnan(deep_lift) and deep_lift >= 0.10: tags.append("沉淀提升")
+            if not tags: tags.append("常规")
 
-            persona = f"{'热度拉升' if (not np.isnan(view_lift) and view_lift>=0.3) else '热度稳定'} + {'互动强' if (not np.isnan(er_lift) and er_lift>=0.2) else '互动常规'} + {'沉淀强' if (not np.isnan(deep_lift) and deep_lift>=0.1) else '沉淀一般'}"
-            suggest = "适合场景：大促/口碑/试水｜合作形式：测评/系列/软植入｜抓手：卖点前置+互动任务+收藏理由｜避坑：避免硬广直给"
+            persona = f"{'热度拉升' if '热度拉升' in tags else '热度稳定'} + {'互动增强' if '互动增强' in tags else '互动常规'} + {'沉淀提升' if '沉淀提升' in tags else '沉淀一般'}"
 
             rows.append({
                 "KOL/UP主": up,
                 "合作视频数": int(len(g_collab)),
-                "基准样本数": int(len(recent)),
+                "基准样本数": int(len(base_pool)),
                 "标签": "、".join(tags),
                 "KOL画像一句话": persona,
-                "合作建议组合": suggest,
+
                 "合作播放中位数": int(collab_view),
                 "基准播放中位数": int(base_view),
                 "播放提升": "-" if np.isnan(view_lift) else f"{view_lift*100:.1f}%",
+
                 "合作互动率中位数": f"{collab_er*100:.2f}%",
                 "基准互动率中位数": f"{base_er*100:.2f}%",
                 "互动率提升": "-" if np.isnan(er_lift) else f"{er_lift*100:.1f}%",
+
+                "合作深度信号中位数": f"{collab_deep*100:.1f}%",
+                "基准深度信号中位数": f"{base_deep*100:.1f}%",
+                "深度信号提升": "-" if np.isnan(deep_lift) else f"{deep_lift*100:.1f}%"
             })
 
         if not rows:
-            st.warning("没有生成任何KOL结果：请先点“一键补齐基准”。")
+            st.warning("没有生成KOL结果：请先“一键补齐”让库内该UP视频条数足够。")
         else:
-            lib = pd.DataFrame(rows).sort_values(["播放提升","互动率提升"], ascending=False)
+            lib = pd.DataFrame(rows)
+            # 排序：先看播放提升，再看互动率提升
+            def _pct_to_float(x):
+                try:
+                    if x == "-" or pd.isna(x):
+                        return -999
+                    return float(str(x).replace("%",""))
+                except Exception:
+                    return -999
+            lib["_view"] = lib["播放提升"].map(_pct_to_float)
+            lib["_er"] = lib["互动率提升"].map(_pct_to_float)
+            lib = lib.sort_values(["_view","_er"], ascending=False).drop(columns=["_view","_er"])
+
             st.dataframe(lib, use_container_width=True, height=420)
             st.download_button(
-                "⬇️ 下载KOL商务资料库（CSV）",
+                "⬇️ 下载KOL对比表（CSV）",
                 data=lib.to_csv(index=False).encode("utf-8-sig"),
-                file_name="kol_business_library.csv",
+                file_name="kol_compare.csv",
                 mime="text/csv"
             )
