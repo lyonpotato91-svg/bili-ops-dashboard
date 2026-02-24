@@ -57,10 +57,10 @@ def load_all_rows() -> pd.DataFrame:
     return df
 
 def upsert_rows(df_new: pd.DataFrame):
-    """INSERT OR REPLACE by (project,bvid)."""
     if df_new is None or df_new.empty:
         return
     init_db()
+
     cols = [
         "project","bvid","url","title","pubdate","owner_mid","owner_name",
         "view","like","coin","favorite","reply","danmaku","share","fans_delta",
@@ -226,15 +226,115 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-def label_vs_baseline(value: float, baseline_mean: float, baseline_std: float) -> str:
-    if baseline_std <= 1e-9 or np.isnan(baseline_std):
-        return "正常发挥"
-    z = (value - baseline_mean) / baseline_std
-    if z >= 1.0:
+# =========================
+# ✅ 全局评价逻辑（核心升级点）
+# - 以“KOL本人近期视频”为基准（默认近20条）
+# - 样本不足 -> “基准不足”
+# - 播放/互动率可分别配置倍率阈值
+# =========================
+def performance_label(value: float,
+                      baseline_values: np.ndarray,
+                      ratio_hi: float,
+                      ratio_lo: float,
+                      z_hi: float,
+                      z_lo: float,
+                      min_n: int) -> str:
+    baseline_values = baseline_values[~np.isnan(baseline_values)]
+    if len(baseline_values) < min_n:
+        return "基准不足"
+    med = float(np.median(baseline_values))
+    mean = float(np.mean(baseline_values))
+    std = float(np.std(baseline_values, ddof=0))
+    ratio = (value / med) if med > 1e-12 else np.inf
+    z = (value - mean) / std if std > 1e-12 else 0.0
+
+    if (ratio >= ratio_hi) or (z >= z_hi):
         return "超常发挥"
-    if z <= -1.0:
+    if (ratio <= ratio_lo) or (z <= z_lo):
         return "低于预期"
     return "正常发挥"
+
+def build_owner_history_cache(df_all: pd.DataFrame) -> dict:
+    """
+    cache[owner_name] = df_owner_sorted_by_pubdate_asc
+    """
+    cache = {}
+    for up, g in df_all.groupby("owner_name"):
+        g2 = g.copy()
+        g2 = g2[pd.notna(g2["pubdate"])]
+        g2 = g2.sort_values("pubdate", ascending=True)
+        cache[up] = g2
+    return cache
+
+def recent_baseline_values(df_owner_sorted: pd.DataFrame,
+                           current_pubdate: pd.Timestamp,
+                           col: str,
+                           window_n: int) -> np.ndarray:
+    """
+    取该UP在 current_pubdate 之前的最近 window_n 条数据作为基准。
+    """
+    if df_owner_sorted is None or df_owner_sorted.empty or pd.isna(current_pubdate):
+        return np.array([], dtype=float)
+
+    # 只取更早发布的内容作为“近期基准”
+    hist = df_owner_sorted[df_owner_sorted["pubdate"] < current_pubdate]
+    if hist.empty:
+        return np.array([], dtype=float)
+
+    tail = hist.tail(window_n)
+    return tail[col].astype(float).to_numpy()
+
+def add_performance_columns(df_show: pd.DataFrame,
+                            df_all_for_baseline: pd.DataFrame,
+                            window_n: int,
+                            min_n: int) -> pd.DataFrame:
+    """
+    给展示用df新增：
+    - view_perf
+    - er_perf
+    """
+    df_show = df_show.copy()
+    df_all_for_baseline = df_all_for_baseline.copy()
+
+    # 用“全库”（含__BASELINE__）作为个人历史基准更合理
+    cache = build_owner_history_cache(df_all_for_baseline)
+
+    view_labels = []
+    er_labels = []
+
+    for _, r in df_show.iterrows():
+        up = r.get("owner_name", "")
+        pub = r.get("pubdate", pd.NaT)
+
+        df_owner = cache.get(up, None)
+
+        # 播放：阈值偏严格一点（爆点更容易被识别出来）
+        view_base = recent_baseline_values(df_owner, pub, "view", window_n)
+        view_labels.append(
+            performance_label(
+                float(r.get("view", 0)),
+                view_base,
+                ratio_hi=1.5, ratio_lo=0.7,
+                z_hi=1.0, z_lo=-1.0,
+                min_n=min_n
+            )
+        )
+
+        # 互动率：倍率阈值略温和
+        er_base = recent_baseline_values(df_owner, pub, "engagement_rate", window_n)
+        er_labels.append(
+            performance_label(
+                float(r.get("engagement_rate", 0.0)),
+                er_base,
+                ratio_hi=1.3, ratio_lo=0.75,
+                z_hi=1.0, z_lo=-1.0,
+                min_n=min_n
+            )
+        )
+
+    df_show["播放表现"] = view_labels
+    df_show["互动率表现"] = er_labels
+    return df_show
 
 # =========================
 # B站抓取
@@ -282,9 +382,20 @@ def fetch_recent_bvids_by_mid(mid: int, n: int = 5) -> list[str]:
     return out
 
 # =========================
-# Sidebar: persistence controls
+# Sidebar: global baseline settings
 # =========================
 st.sidebar.title("📊 B站运营Dashboard")
+
+st.sidebar.markdown("#### 全局“发挥评价”口径（已升级）")
+baseline_window_n = st.sidebar.slider("KOL近期基准：取最近N条视频", 5, 60, 20, step=5)
+baseline_min_n = st.sidebar.slider("最低样本数（不足则显示“基准不足”）", 1, 20, 8, step=1)
+st.sidebar.caption("说明：所有“正常/超常/低于预期”都基于该UP主近期视频对比，而不是项目内对比。")
+
+st.sidebar.divider()
+
+# =========================
+# Sidebar: persistence controls
+# =========================
 st.sidebar.markdown("#### 数据保存（刷新/换设备不丢）")
 
 with st.sidebar.expander("备份/恢复", expanded=False):
@@ -458,6 +569,17 @@ df_main = df_db[df_db["project"] != BASELINE_PROJECT].copy()
 df_f = df_main[df_main["project"].isin(sel_projects)].copy() if sel_projects else df_main.copy()
 
 # =========================
+# ✅ 给主展示df加入“播放表现/互动率表现”（全局口径）
+# 用全库df_db（含__BASELINE__）做个人近期基准
+# =========================
+df_f = add_performance_columns(
+    df_show=df_f,
+    df_all_for_baseline=df_db,
+    window_n=baseline_window_n,
+    min_n=baseline_min_n
+)
+
+# =========================
 # KPI cards
 # =========================
 c1, c2, c3, c4 = st.columns(4)
@@ -470,7 +592,6 @@ c4.metric("深度信号占比(币+藏/互动)", f"{df_f['deep_signal_ratio'].mea
 # Cross project comparison + quadrant
 # =========================
 st.subheader("跨项目对比（项目之间谁更强、谁更稳）")
-
 proj_rows = []
 for proj, g in df_f.groupby("project"):
     g2 = g.sort_values("view", ascending=False).copy()
@@ -537,49 +658,103 @@ if len(proj_df) >= 2:
     fig2.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
     st.plotly_chart(fig2, use_container_width=True)
 
+# =========================
+# Project table (now includes performance labels)
+# =========================
 st.divider()
+st.subheader("项目内视频表现（按播放排序）")
+
+show_cols = [
+    "project","bvid","title","owner_name","pubdate",
+    "view","播放表现",
+    "engagement_rate","互动率表现",
+    "like","coin","favorite","reply",
+    "deep_signal_ratio"
+]
+st.dataframe(
+    df_f[show_cols].sort_values("view", ascending=False),
+    use_container_width=True,
+    height=360
+)
+
+# =========================
+# Top/Bottom Deep dive (use new labels)
+# =========================
+st.subheader("Top / Bottom 深挖（含KOL近期基准判断）")
+for proj in sel_projects if sel_projects else projects:
+    d = df_f[df_f["project"] == proj].sort_values("view", ascending=False)
+    if d.empty:
+        continue
+
+    top = d.iloc[0]
+    bottom = d.iloc[-1]
+
+    st.markdown(f"### 项目：{proj}")
+    left, right = st.columns(2)
+
+    def render_card(col, row, tag):
+        col.markdown(f"**{tag}：{row['title']}**")
+        col.caption(f"UP：{row['owner_name']} ｜ BV：{row['bvid']} ｜ 发布：{row['pubdate']}")
+        col.metric("播放", f"{int(row['view']):,}", row["播放表现"])
+        col.metric("互动率", f"{row['engagement_rate']*100:.2f}%", row["互动率表现"])
+        col.write(f"- 赞/币/藏/评：{int(row['like'])}/{int(row['coin'])}/{int(row['favorite'])}/{int(row['reply'])}")
+        col.write(f"- 深度信号占比：{row['deep_signal_ratio']*100:.1f}%")
+
+    render_card(left, top, "🔥 最高播放")
+    render_card(right, bottom, "🧊 最低播放")
+
+# =========================
+# Box plot
+# =========================
+st.subheader("互动率分布（项目/UP主快速定位异常）")
+fig = px.box(df_f, x="project", y="engagement_rate", points="all", hover_data=["title","owner_name","view"])
+st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# Auto insights
+# =========================
+st.subheader("自动解读（可复制进周报）")
+best = df_f.sort_values("view", ascending=False).iloc[0]
+worst = df_f.sort_values("view", ascending=True).iloc[0]
+insights = []
+insights.append(
+    f"1）本期最高播放来自《{best['title']}》（{int(best['view']):,} 播放，{best['播放表现']}），互动率 {best['engagement_rate']*100:.2f}%（{best['互动率表现']}）。"
+)
+insights.append(
+    f"2）最低播放为《{worst['title']}》（{int(worst['view']):,} 播放，{worst['播放表现']}），互动率 {worst['engagement_rate']*100:.2f}%（{worst['互动率表现']}）。建议优先检查封面/标题信息密度与投放时段，并在评论区做更强的互动引导。"
+)
+if df_f["deep_signal_ratio"].mean() < 0.35:
+    insights.append("3）整体深度信号偏低（币+藏在互动中的占比不高），说明内容更多是“路过型热度”，建议强化：价值点前置、结尾引导收藏/投币、增加系列化承诺。")
+else:
+    insights.append("3）整体深度信号健康（币+藏占比高），说明内容具备沉淀属性，可考虑围绕该方向做系列化与固定栏目节奏。")
+st.write("\n".join(insights))
 
 # =========================================================
-# KOL module (independent) + DIAGNOSIS
+# KOL module (independent) + Diagnosis
+# （KOL模块也会受全局“近期基准口径”影响，因为baseline数据会进入df_db）
 # =========================================================
-st.subheader("KOL合作资料库（独立模块：含诊断，避免只出1人）")
+st.divider()
+st.subheader("KOL合作资料库（独立模块：含诊断）")
 
 all_projects = projects
 default_collab = sel_projects if sel_projects else all_projects
 
 with st.expander("KOL模块设置（默认即可）", expanded=False):
     collab_projects = st.multiselect("哪些项目算“合作项目”", all_projects, default=default_collab)
-
-    baseline_pref = st.radio(
-        "日常基准怎么取？",
-        ["优先用非合作项目视频（更像‘日常’）", "用该UP在库里所有视频（更宽松）"],
-        index=1
-    )
-    min_baseline_n = st.slider("基准最少需要多少条视频（太少不判定）", 1, 30, 3)
-    extra_baseline_n = st.slider("自动补齐：每个KOL额外抓几条日常视频", 0, 10, 5)
+    extra_baseline_n = st.slider("自动补齐：每个KOL额外抓几条日常视频", 0, 30, 10)
     sleep_sec = st.slider("抓取间隔（防限流）", 0.2, 2.0, 0.8, step=0.1)
 
-    lift_view_pct = st.slider("播放提升阈值（相对基准中位数）", 0, 300, 30, step=5)
-    lift_er_pct = st.slider("互动率提升阈值（相对基准中位数）", 0, 300, 20, step=5)
-    lift_deep_pct = st.slider("深度信号提升阈值（相对基准中位数）", 0, 300, 10, step=5)
-    z_threshold = st.slider("Z分数阈值", 0.0, 3.0, 1.0, step=0.1)
-    require_both = st.checkbox("更严格：播放&互动率都要明显更好才标注", value=False)
-
-cA, cB, cC = st.columns([1,1,2])
+cA, cB = st.columns(2)
 with cA:
-    fetch_baseline_btn = st.button("🧲 自动抓KOL日常样本（补齐4-5条，保存）")
+    fetch_baseline_btn = st.button("🧲 自动抓KOL日常样本（保存到库）")
 with cB:
-    build_kol_btn = st.button("📚 生成/刷新KOL商务资料库")
-with cC:
-    st.caption("若结果只有1人：先看下面“诊断表”，通常是基准不足或CSV缺owner_mid导致无法抓样本。")
+    build_kol_btn = st.button("📚 生成KOL资料库（基于全局近期口径）")
 
-if not collab_projects:
-    st.info("请选择至少一个合作项目。")
-else:
+if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
 
     if collab_df.empty:
-        st.warning("合作项目下没有任何数据：请确认项目名是否与数据中的 project 完全一致。")
+        st.warning("合作项目下没有数据：请确认项目名与数据里的 project 完全一致。")
     else:
         st.caption(f"合作UP主数：{collab_df['owner_name'].nunique()}｜合作视频数：{len(collab_df)}")
 
@@ -621,7 +796,7 @@ else:
             if failed_no_mid > 0:
                 st.warning(
                     f"有 {failed_no_mid} 位UP缺少 owner_mid，无法自动抓日常样本。"
-                    "建议：用“链接/BV采集”方式采合作视频（会自动带owner_mid），或在CSV里补一列 owner_mid。"
+                    "建议：用“链接/BV采集”方式采合作视频（会带owner_mid），或CSV补 owner_mid。"
                 )
 
             if rows_new:
@@ -634,134 +809,79 @@ else:
             else:
                 st.warning("未抓到可新增的日常样本（可能限流/接口波动/样本已存在）。")
 
-    # ======== Diagnosis table ========
-    st.markdown("**KOL生成诊断（为什么只出少数结果，一眼看这里）**")
-    df_all = compute_metrics(df_db.copy())
-    diag_rows = []
-
-    for up, g_collab in collab_df.groupby("owner_name"):
-        collab_n = len(g_collab)
-        has_mid = g_collab["owner_mid"].notna().any()
-
-        hidden_base = df_all[(df_all["project"] == BASELINE_PROJECT) & (df_all["baseline_for"] == up)]
-        non_collab_base = df_all[
-            (df_all["owner_name"] == up)
-            & (~df_all["project"].isin(collab_projects))
-            & (df_all["project"] != BASELINE_PROJECT)
-        ]
-        all_base = df_all[df_all["owner_name"] == up]
-
-        if baseline_pref.startswith("优先用非合作"):
-            base_n = len(pd.concat([hidden_base, non_collab_base]).drop_duplicates(subset=["bvid"]))
-        else:
-            base_n = len(pd.concat([hidden_base, all_base]).drop_duplicates(subset=["bvid"]))
-
-        if collab_n <= 0:
-            status = "无合作视频"
-        elif base_n < min_baseline_n:
-            status = f"基准不足({base_n}<{min_baseline_n})"
-        elif (not has_mid) and len(hidden_base) == 0:
-            status = "缺owner_mid且无已抓基准"
-        else:
-            status = "可生成"
-
-        diag_rows.append({
+    # 诊断表：哪个KOL的近期基准不足
+    st.markdown("**KOL基准诊断（谁的近期样本不足）**")
+    df_all = df_db.copy()
+    diag = []
+    for up, g in collab_df.groupby("owner_name"):
+        owner_all = df_all[df_all["owner_name"] == up].copy()
+        owner_all = owner_all[pd.notna(owner_all["pubdate"])].sort_values("pubdate", ascending=True)
+        # “近期基准”样本量：取最后 baseline_window_n 条（不区分合作/非合作）
+        base_n = int(min(len(owner_all), baseline_window_n))
+        diag.append({
             "KOL/UP主": up,
-            "合作视频数": collab_n,
-            "基准视频数": base_n,
-            "是否有owner_mid": "有" if has_mid else "无",
-            "隐藏基准样本数": int(len(hidden_base)),
-            "状态": status
+            "库内视频数": int(len(owner_all)),
+            "可用于近期基准的样本数": base_n,
+            "状态": "基准不足" if base_n < baseline_min_n else "OK"
         })
+    diag_df = pd.DataFrame(diag).sort_values(["状态","库内视频数"], ascending=[True, False])
+    st.dataframe(diag_df, use_container_width=True, height=260)
 
-    diag_df = pd.DataFrame(diag_rows).sort_values(["状态","合作视频数"], ascending=[True, False])
-    st.dataframe(diag_df, use_container_width=True, height=280)
-
-    # ======== Build KOL library ========
+    # 生成KOL库：以合作视频相对“该UP近期基准”的提升来给标签
     if build_kol_btn:
+        df_all_m = compute_metrics(df_db.copy())
         rows = []
-        collab_df2 = df_all[df_all["project"].isin(collab_projects)].copy()
+        for up, g_collab in df_all_m[df_all_m["project"].isin(collab_projects)].groupby("owner_name"):
+            owner_all = df_all_m[df_all_m["owner_name"] == up].copy()
+            owner_all = owner_all[pd.notna(owner_all["pubdate"])].sort_values("pubdate", ascending=True)
 
-        for up, g_collab in collab_df2.groupby("owner_name"):
-            base_hidden = df_all[(df_all["project"] == BASELINE_PROJECT) & (df_all["baseline_for"] == up)].copy()
-
-            if baseline_pref.startswith("优先用非合作"):
-                base_non_collab = df_all[
-                    (df_all["owner_name"] == up)
-                    & (~df_all["project"].isin(collab_projects))
-                    & (df_all["project"] != BASELINE_PROJECT)
-                ].copy()
-                g_base = pd.concat([base_hidden, base_non_collab], ignore_index=True)
-                if len(g_base) < min_baseline_n:
-                    g_base = pd.concat([base_hidden, df_all[df_all["owner_name"] == up]], ignore_index=True)
-            else:
-                g_base = pd.concat([base_hidden, df_all[df_all["owner_name"] == up]], ignore_index=True)
-
-            g_base = g_base.drop_duplicates(subset=["bvid"], keep="last")
-            if len(g_base) < min_baseline_n:
+            # 用该UP“近期基准”的中位数做对比（简单稳定）
+            recent = owner_all.tail(baseline_window_n)
+            if len(recent) < baseline_min_n:
                 continue
 
-            base_view_med = float(g_base["view"].median())
-            base_er_med = float(g_base["engagement_rate"].median())
-            base_deep_med = float(g_base["deep_signal_ratio"].median())
+            base_view = float(recent["view"].median())
+            base_er = float(recent["engagement_rate"].median())
+            base_deep = float(recent["deep_signal_ratio"].median())
 
-            base_view_mean = float(g_base["view"].mean())
-            base_view_std = float(g_base["view"].std(ddof=0)) if float(g_base["view"].std(ddof=0)) > 1e-9 else 0.0
-            base_er_mean = float(g_base["engagement_rate"].mean())
-            base_er_std = float(g_base["engagement_rate"].std(ddof=0)) if float(g_base["engagement_rate"].std(ddof=0)) > 1e-12 else 0.0
-            base_deep_mean = float(g_base["deep_signal_ratio"].mean())
-            base_deep_std = float(g_base["deep_signal_ratio"].std(ddof=0)) if float(g_base["deep_signal_ratio"].std(ddof=0)) > 1e-12 else 0.0
+            collab_view = float(g_collab["view"].median())
+            collab_er = float(g_collab["engagement_rate"].median())
+            collab_deep = float(g_collab["deep_signal_ratio"].median())
 
-            collab_view_med = float(g_collab["view"].median())
-            collab_er_med = float(g_collab["engagement_rate"].median())
-            collab_deep_med = float(g_collab["deep_signal_ratio"].median())
+            view_lift = (collab_view / base_view - 1.0) if base_view > 0 else np.nan
+            er_lift = (collab_er / base_er - 1.0) if base_er > 0 else np.nan
+            deep_lift = (collab_deep / base_deep - 1.0) if base_deep > 0 else np.nan
 
-            view_lift = (collab_view_med / base_view_med - 1.0) if base_view_med > 0 else np.nan
-            er_lift = (collab_er_med / base_er_med - 1.0) if base_er_med > 0 else np.nan
-            deep_lift = (collab_deep_med / base_deep_med - 1.0) if base_deep_med > 0 else np.nan
-
-            z_view = (collab_view_med - base_view_mean) / base_view_std if base_view_std > 0 else 0.0
-            z_er = (collab_er_med - base_er_mean) / base_er_std if base_er_std > 0 else 0.0
-            z_deep = (collab_deep_med - base_deep_mean) / base_deep_std if base_deep_std > 0 else 0.0
-
-            cond_view = (not np.isnan(view_lift)) and (view_lift >= lift_view_pct/100.0) and (z_view >= z_threshold)
-            cond_er = (not np.isnan(er_lift)) and (er_lift >= lift_er_pct/100.0) and (z_er >= z_threshold)
-            cond_deep = (not np.isnan(deep_lift)) and (deep_lift >= lift_deep_pct/100.0) and (z_deep >= z_threshold)
-            is_good = (cond_view and cond_er) if require_both else (cond_view or cond_er or cond_deep)
-
-            top3 = g_collab.sort_values("view", ascending=False).head(3)
-            top3_titles = "｜".join([str(t)[:30] for t in top3["title"].tolist()])
-            top3_links = "｜".join([f"https://www.bilibili.com/video/{b}" for b in top3["bvid"].tolist()])
-
+            # 商务标签
             tags = []
             if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升型")
             if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("强互动引爆")
             if not np.isnan(deep_lift) and deep_lift >= 0.10: tags.append("价值沉淀型")
             if not tags: tags.append("常规表现")
 
-            heat = "热度拉升" if (not np.isnan(view_lift) and view_lift >= 0.30) else "热度稳定"
-            interact = "互动强" if (not np.isnan(er_lift) and er_lift >= 0.20) else "互动常规"
-            depth = "沉淀强" if (not np.isnan(deep_lift) and deep_lift >= 0.10) else "沉淀一般"
-            persona = f"{heat} + {interact} + {depth}"
+            persona = f"{'热度拉升' if (not np.isnan(view_lift) and view_lift>=0.3) else '热度稳定'} + {'互动强' if (not np.isnan(er_lift) and er_lift>=0.2) else '互动常规'} + {'沉淀强' if (not np.isnan(deep_lift) and deep_lift>=0.1) else '沉淀一般'}"
 
             suggestion_bundle = "适合场景：大促/口碑/试水｜合作形式：测评/系列/软植入｜内容抓手：前3秒卖点+互动任务+收藏理由｜避坑：避免硬广直给"
 
             rows.append({
                 "KOL/UP主": up,
-                "标注": "⭐ 合作明显更好" if is_good else "",
+                "合作视频数": int(len(g_collab)),
+                "近期基准样本数": int(len(recent)),
                 "标签": "、".join(tags),
                 "KOL画像一句话": persona,
                 "合作建议组合": suggestion_bundle,
-                "合作视频数": int(len(g_collab)),
-                "基准视频数": int(len(g_base)),
-                "证据-合作Top3标题": top3_titles,
-                "证据-合作Top3链接": top3_links,
+                "合作播放中位数": int(collab_view),
+                "基准播放中位数": int(base_view),
+                "播放提升": "-" if np.isnan(view_lift) else f"{view_lift*100:.1f}%",
+                "合作互动率中位数": f"{collab_er*100:.2f}%",
+                "基准互动率中位数": f"{base_er*100:.2f}%",
+                "互动率提升": "-" if np.isnan(er_lift) else f"{er_lift*100:.1f}%",
             })
 
         if not rows:
-            st.warning("没有生成任何KOL结果：请看上面的诊断表（大概率是基准不足/缺owner_mid）。")
+            st.warning("没有生成任何KOL结果：多数UP可能“近期基准样本不足”。先补齐样本再生成。")
         else:
-            lib = pd.DataFrame(rows)
+            lib = pd.DataFrame(rows).sort_values(["播放提升","互动率提升"], ascending=False)
             st.dataframe(lib, use_container_width=True, height=420)
             st.download_button(
                 "⬇️ 下载KOL商务资料库（CSV）",
@@ -769,70 +889,3 @@ else:
                 file_name="kol_business_library.csv",
                 mime="text/csv"
             )
-
-# =========================
-# Project table
-# =========================
-st.divider()
-st.subheader("项目内视频表现（按播放排序）")
-show_cols = [
-    "project","bvid","title","owner_name","pubdate",
-    "view","like","coin","favorite","reply","engagement_rate","deep_signal_ratio"
-]
-st.dataframe(df_f[show_cols].sort_values("view", ascending=False), use_container_width=True, height=320)
-
-# =========================
-# Top/Bottom
-# =========================
-st.subheader("Top / Bottom 深挖（含Up主基准对比）")
-for proj in sel_projects if sel_projects else projects:
-    d = df_f[df_f["project"] == proj].sort_values("view", ascending=False)
-    if d.empty:
-        continue
-    top = d.iloc[0]
-    bottom = d.iloc[-1]
-
-    st.markdown(f"### 项目：{proj}")
-    left, right = st.columns(2)
-
-    def render_card(col, row, tag):
-        up = row["owner_name"]
-        base = df_f[df_f["owner_name"] == up]
-        mean_v, std_v = base["view"].mean(), base["view"].std(ddof=0)
-        mean_er, std_er = base["engagement_rate"].mean(), base["engagement_rate"].std(ddof=0)
-
-        col.markdown(f"**{tag}：{row['title']}**")
-        col.caption(f"UP：{up} ｜ BV：{row['bvid']} ｜ 发布：{row['pubdate']}")
-        col.metric("播放", f"{int(row['view']):,}", label_vs_baseline(row["view"], mean_v, std_v))
-        col.metric("互动率", f"{row['engagement_rate']*100:.2f}%", label_vs_baseline(row["engagement_rate"], mean_er, std_er))
-        col.write(f"- 赞/币/藏/评：{int(row['like'])}/{int(row['coin'])}/{int(row['favorite'])}/{int(row['reply'])}")
-        col.write(f"- 深度信号占比：{row['deep_signal_ratio']*100:.1f}%")
-
-    render_card(left, top, "🔥 最高播放")
-    render_card(right, bottom, "🧊 最低播放")
-
-# =========================
-# Box plot
-# =========================
-st.subheader("互动率分布（项目/UP主快速定位异常）")
-fig = px.box(df_f, x="project", y="engagement_rate", points="all", hover_data=["title","owner_name","view"])
-st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# Auto insights
-# =========================
-st.subheader("自动解读（可复制进周报）")
-best = df_f.sort_values("view", ascending=False).iloc[0]
-worst = df_f.sort_values("view", ascending=True).iloc[0]
-insights = []
-insights.append(
-    f"1）本期最高播放来自《{best['title']}》（{int(best['view']):,} 播放），互动率 {best['engagement_rate']*100:.2f}%，深度信号占比 {best['deep_signal_ratio']*100:.1f}%。"
-)
-insights.append(
-    f"2）最低播放为《{worst['title']}》（{int(worst['view']):,} 播放），互动率 {worst['engagement_rate']*100:.2f}%。建议检查封面/标题信息密度与投放时段，并在评论区做更强的互动引导。"
-)
-if df_f["deep_signal_ratio"].mean() < 0.35:
-    insights.append("3）整体深度信号偏低（币+藏在互动中的占比不高），说明内容更多是“路过型热度”，建议强化：价值点前置、结尾引导收藏/投币、增加系列化承诺。")
-else:
-    insights.append("3）整体深度信号健康（币+藏占比高），说明内容具备沉淀属性，可考虑围绕该方向做系列化与固定栏目节奏。")
-st.write("\n".join(insights))
