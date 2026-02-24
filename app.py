@@ -41,7 +41,6 @@ def _safe_str(x, default=""):
         return default
 
 def _safe_date(x):
-    # Accept: YYYY-MM-DD, YYYY/MM/DD, timestamp, etc.
     try:
         if pd.isna(x):
             return pd.NaT
@@ -53,15 +52,9 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """Standardize columns + dtypes, and ensure required columns exist."""
     df = df.copy()
 
-    # normalize column names: strip, lower
     df.columns = [str(c).strip() for c in df.columns]
     col_map_lower = {c.lower(): c for c in df.columns}
 
-    # Make sure required columns exist (case-insensitive)
-    def pick(col):
-        return col_map_lower.get(col, None)
-
-    # Try to map common Chinese headers to our standard schema
     zh_alias = {
         "项目": "project",
         "项目名": "project",
@@ -86,14 +79,12 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         "bvid": "bvid",
     }
 
-    # Build rename dict
     rename = {}
     for c in df.columns:
         key = str(c).strip()
         if key in zh_alias:
             rename[c] = zh_alias[key]
         else:
-            # also handle lowercase match
             low = key.lower()
             if low in ["project","url","bvid","title","owner_name","owner_mid","pubdate",
                        "view","like","coin","favorite","reply","danmaku","share","fans_delta","fetched_at"]:
@@ -101,45 +92,37 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns=rename)
 
-    # If url exists but bvid missing, try parse
     if "bvid" not in df.columns and "url" in df.columns:
         df["bvid"] = df["url"].apply(parse_bvid)
 
-    # If bvid exists but has URLs inside, parse them
     if "bvid" in df.columns:
         df["bvid"] = df["bvid"].apply(lambda x: parse_bvid(x) if isinstance(x, str) else x)
         df["bvid"] = df["bvid"].apply(lambda x: _safe_str(x))
 
-    # Ensure required text cols exist
     for col in ["project", "title", "owner_name"]:
         if col not in df.columns:
             df[col] = ""
 
-    # Parse dates
     if "pubdate" not in df.columns:
         df["pubdate"] = pd.NaT
     df["pubdate"] = df["pubdate"].apply(_safe_date)
 
-    # Ensure numeric cols exist
     for col in NUM_COLS:
         if col not in df.columns:
             df[col] = 0
         df[col] = df[col].apply(_safe_int)
 
-    # Ensure fetched_at exists
     if "fetched_at" not in df.columns:
         df["fetched_at"] = pd.Timestamp.now()
     else:
         df["fetched_at"] = pd.to_datetime(df["fetched_at"], errors="coerce")
         df["fetched_at"] = df["fetched_at"].fillna(pd.Timestamp.now())
 
-    # Keep only known cols + required
     keep = set(["project","bvid","url","title","pubdate","owner_mid","owner_name",
                 "view","like","coin","favorite","reply","danmaku","share","fans_delta","fetched_at"])
     existing = [c for c in df.columns if c in keep]
     df = df[existing].copy()
 
-    # Drop rows without bvid/title (best effort)
     if "bvid" in df.columns:
         df = df[df["bvid"].astype(str).str.startswith("BV")]
 
@@ -171,10 +154,6 @@ def label_vs_baseline(value: float, baseline_mean: float, baseline_std: float) -
 # B站抓取（链接/BV采集）
 # =========================
 def fetch_video_stats_by_bvid(bvid: str) -> dict:
-    """
-    返回字段：title, pubdate, owner_mid, owner_name, view, like, coin, favorite, reply, danmaku, share
-    注意：接口可变；失败会抛错，前端提示改用CSV导入兜底。
-    """
     api = "https://api.bilibili.com/x/web-interface/view"
     headers = {"User-Agent": "Mozilla/5.0"}  # ✅ 提升稳定性
 
@@ -223,7 +202,6 @@ def append_df_to_session(df_new: pd.DataFrame):
     df_new = normalize_df(df_new)
 
     merged = pd.concat([existing, df_new], ignore_index=True)
-    # 去重：同一项目同一BV，保留最新 fetched_at
     merged = merged.sort_values("fetched_at", ascending=True)
     merged = merged.drop_duplicates(subset=["project", "bvid"], keep="last")
 
@@ -236,7 +214,6 @@ st.sidebar.title("📊 B站运营Dashboard")
 
 mode = st.sidebar.radio("数据来源", ["粘贴链接/BV采集", "上传CSV导入"], index=0)
 
-# ---- CSV 模板下载（可选）
 st.sidebar.markdown("#### CSV模板（可选）")
 template_df = pd.DataFrame([{
     "project": "枕刀歌",
@@ -259,7 +236,6 @@ st.sidebar.download_button("下载CSV模板", data=csv_bytes, file_name="bili_da
 
 st.sidebar.divider()
 
-# ---- Mode A: Link/BV collection
 if mode == "粘贴链接/BV采集":
     project = st.sidebar.text_input("项目名（用于归档）", value="未命名项目")
     links = st.sidebar.text_area("粘贴视频链接/ BV号（每行一个）")
@@ -281,7 +257,7 @@ if mode == "粘贴链接/BV采集":
                 row["url"] = it
                 rows.append(row)
                 ok += 1
-                time.sleep(0.4)  # 放慢，降低被限流概率
+                time.sleep(0.4)
             except Exception:
                 fail += 1
 
@@ -289,7 +265,6 @@ if mode == "粘贴链接/BV采集":
             append_df_to_session(pd.DataFrame(rows))
         st.sidebar.success(f"成功采集 {ok} 条，失败 {fail} 条（失败可用CSV导入兜底）")
 
-# ---- Mode B: CSV import
 else:
     st.sidebar.markdown("#### 上传CSV并自动归档")
     default_project = st.sidebar.text_input("缺少 project 列时：默认项目名", value="未命名项目")
@@ -302,7 +277,6 @@ else:
             st.sidebar.error("请先选择一个CSV文件。")
         else:
             raw = uploaded.getvalue()
-            # 兼容中文常见编码：utf-8-sig / gbk
             df_csv = None
             for enc in ["utf-8-sig", "utf-8", "gbk"]:
                 try:
@@ -316,7 +290,6 @@ else:
             else:
                 df_csv = normalize_df(df_csv)
 
-                # 如果导入后 project 全为空，用默认项目名补齐
                 if "project" not in df_csv.columns:
                     df_csv["project"] = default_project
                 df_csv["project"] = df_csv["project"].apply(lambda x: _safe_str(x).strip())
@@ -331,7 +304,6 @@ else:
 df = pd.DataFrame(st.session_state["rows"])
 df = normalize_df(df) if not df.empty else df
 
-# Top bar controls
 st.title("B站日常运营数据 Dashboard")
 
 if df.empty:
@@ -340,7 +312,6 @@ if df.empty:
 
 df = compute_metrics(df)
 
-# Filters
 st.sidebar.divider()
 projects = sorted([p for p in df["project"].dropna().unique().tolist() if str(p).strip() != ""])
 sel_projects = st.sidebar.multiselect("选择项目（筛选展示）", projects, default=projects if projects else None)
@@ -354,6 +325,124 @@ c1.metric("总播放", f"{int(df_f['view'].sum()):,}")
 c2.metric("总互动(赞+币+藏+评)", f"{int(df_f['engagement'].sum()):,}")
 c3.metric("平均互动率", f"{df_f['engagement_rate'].mean()*100:.2f}%")
 c4.metric("深度信号占比(币+藏/互动)", f"{df_f['deep_signal_ratio'].mean()*100:.1f}%")
+
+# =========================================================
+# ✅ 新增：跨项目对比（排行榜 + 四象限）
+# =========================================================
+st.subheader("跨项目对比（项目之间谁更强、谁更稳）")
+
+# 项目汇总：用“中位数”作为典型水平（更抗异常点），同时保留总量指标
+proj_rows = []
+for proj, g in df_f.groupby("project"):
+    g2 = g.sort_values("view", ascending=False).copy()
+    total_view = int(g2["view"].sum())
+    total_eng = int(g2["engagement"].sum())
+    video_cnt = int(len(g2))
+    up_cnt = int(g2["owner_name"].nunique()) if "owner_name" in g2.columns else 0
+
+    # 典型水平（中位数）
+    er_med = float(g2["engagement_rate"].median())
+    deep_med = float(g2["deep_signal_ratio"].median())
+
+    # 波动（用IQR衡量稳定性）
+    er_q1 = float(g2["engagement_rate"].quantile(0.25))
+    er_q3 = float(g2["engagement_rate"].quantile(0.75))
+    er_iqr = er_q3 - er_q1
+
+    # Top视频贡献（头部依赖程度）
+    top1_view = int(g2.iloc[0]["view"]) if video_cnt > 0 else 0
+    top3_view = int(g2.head(3)["view"].sum()) if video_cnt > 0 else 0
+    top1_share = (top1_view / total_view) if total_view > 0 else 0.0
+    top3_share = (top3_view / total_view) if total_view > 0 else 0.0
+
+    proj_rows.append({
+        "project": proj,
+        "视频数": video_cnt,
+        "UP数": up_cnt,
+        "总播放": total_view,
+        "总互动": total_eng,
+        "互动率中位数": er_med,
+        "深度信号中位数": deep_med,
+        "互动率波动(IQR)": er_iqr,
+        "Top1播放贡献": top1_share,
+        "Top3播放贡献": top3_share,
+    })
+
+proj_df = pd.DataFrame(proj_rows).sort_values("总播放", ascending=False)
+
+# 展示排行榜表
+show_proj_cols = ["project","视频数","UP数","总播放","总互动","互动率中位数","深度信号中位数","互动率波动(IQR)","Top1播放贡献","Top3播放贡献"]
+st.dataframe(
+    proj_df[show_proj_cols]
+      .assign(**{
+          "互动率中位数": (proj_df["互动率中位数"]*100).map(lambda x: f"{x:.2f}%"),
+          "深度信号中位数": (proj_df["深度信号中位数"]*100).map(lambda x: f"{x:.1f}%"),
+          "互动率波动(IQR)": (proj_df["互动率波动(IQR)"]*100).map(lambda x: f"{x:.2f}pp"),
+          "Top1播放贡献": (proj_df["Top1播放贡献"]*100).map(lambda x: f"{x:.1f}%"),
+          "Top3播放贡献": (proj_df["Top3播放贡献"]*100).map(lambda x: f"{x:.1f}%"),
+      }),
+    use_container_width=True,
+    height=260
+)
+
+# 四象限图：X=互动率中位数，Y=深度信号中位数
+st.markdown("**项目四象限（X=互动率中位数，Y=深度信号中位数）**")
+if len(proj_df) >= 2:
+    x_med = float(proj_df["互动率中位数"].median())
+    y_med = float(proj_df["深度信号中位数"].median())
+
+    fig2 = px.scatter(
+        proj_df,
+        x="互动率中位数",
+        y="深度信号中位数",
+        size="总播放",
+        hover_data=["视频数","UP数","总播放","Top1播放贡献","Top3播放贡献","互动率波动(IQR)"],
+        text="project",
+    )
+    # 参考线（全局中位数）
+    fig2.add_vline(x=x_med, line_dash="dash")
+    fig2.add_hline(y=y_med, line_dash="dash")
+
+    fig2.update_traces(textposition="top center")
+    fig2.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # 自动结论（偏运营口吻）
+    st.markdown("**项目解读（可直接写进周报）**")
+    bullets = []
+    for _, r in proj_df.iterrows():
+        proj = r["project"]
+        er = r["互动率中位数"]
+        deep = r["深度信号中位数"]
+        top1 = r["Top1播放贡献"]
+        iqr = r["互动率波动(IQR)"]
+
+        # 象限判断
+        if er >= x_med and deep >= y_med:
+            tag = "又热又沉淀（优先加码）"
+        elif er >= x_med and deep < y_med:
+            tag = "热闹但偏浅（强化收藏/投币引导）"
+        elif er < x_med and deep >= y_med:
+            tag = "小众但真爱（适合系列化/精准投放）"
+        else:
+            tag = "偏弱（重点复盘选题&包装&分发）"
+
+        # 头部依赖&稳定性补充
+        extra = []
+        if top1 >= 0.45:
+            extra.append("头部依赖高（Top1贡献偏大，需补中腰部）")
+        if iqr >= (proj_df["互动率波动(IQR)"].median() if len(proj_df) > 0 else iqr):
+            extra.append("波动较大（内容/分发不稳定）")
+
+        extra_txt = f"；{ '；'.join(extra) }" if extra else ""
+        bullets.append(
+            f"- 互动率中位数 {er*100:.2f}%，深度信号中位数 {deep*100:.1f}%：{tag}{extra_txt}"
+        )
+    st.write("\n".join(bullets))
+else:
+    st.info("项目数不足（<2）时，四象限对比意义不大。再导入/采集至少两个项目的数据即可展示。")
+
+st.divider()
 
 # =========================
 # Table
@@ -411,7 +500,6 @@ for proj in (sel_projects if sel_projects else projects):
         col.write(f"- 赞/币/藏/评：{like:,}/{coin:,}/{fav:,}/{rep:,}")
         col.write(f"- 深度信号占比：{deep:.1f}%")
 
-        # 粉丝增长（如果有）
         if "fans_delta" in df.columns:
             fd = int(row.get("fans_delta", 0))
             col.write(f"- 粉丝净增（如有）：{fd:,}")
@@ -457,7 +545,6 @@ else:
         "3）整体深度信号健康（币+藏占比高），说明内容具备沉淀属性。建议围绕该方向做系列化与固定栏目节奏，提升可预期的复看与关注转化。"
     )
 
-# 粉丝净增（如果可用）
 if "fans_delta" in df_f.columns and df_f["fans_delta"].abs().sum() > 0:
     total_fd = int(df_f["fans_delta"].sum())
     insights.append(f"4）项目口径下粉丝净增合计：{total_fd:,}（如该列来自CSV/快照口径，可作为转粉效率复盘依据）。")
