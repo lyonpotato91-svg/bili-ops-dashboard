@@ -13,7 +13,7 @@ st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
 # =========================
 # Constants
 # =========================
-BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不进入项目归档列表
+BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不出现在项目归档/筛选里
 DB_PATH = "bili_dashboard.db"           # SQLite文件（持久化）
 TABLE_NAME = "videos"
 
@@ -72,7 +72,6 @@ def upsert_rows(df_new: pd.DataFrame):
             df_new[c] = None
     df_new = df_new[cols]
 
-    # sqlite prefers python scalars
     records = []
     for _, r in df_new.iterrows():
         records.append(tuple(None if pd.isna(v) else v for v in r.tolist()))
@@ -156,6 +155,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         "bvid": "bvid",
         "基准归属": "baseline_for",
         "数据类型": "data_type",
+        "抓取时间": "fetched_at",
     }
 
     rename = {}
@@ -202,7 +202,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         df["fetched_at"] = pd.Timestamp.now()
     df["fetched_at"] = pd.to_datetime(df["fetched_at"], errors="coerce").fillna(pd.Timestamp.now())
 
-    # Keep only known cols
     keep = set([
         "project","bvid","url","title","pubdate","owner_mid","owner_name",
         "view","like","coin","favorite","reply","danmaku","share","fans_delta",
@@ -210,7 +209,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     ])
     df = df[[c for c in df.columns if c in keep]].copy()
 
-    # valid BV only
     if "bvid" in df.columns:
         df = df[df["bvid"].astype(str).str.startswith("BV")]
 
@@ -287,25 +285,22 @@ def fetch_recent_bvids_by_mid(mid: int, n: int = 5) -> list[str]:
 # Sidebar: persistence controls
 # =========================
 st.sidebar.title("📊 B站运营Dashboard")
-st.sidebar.markdown("#### 数据保存")
-colx, coly = st.sidebar.columns(2)
+st.sidebar.markdown("#### 数据保存（刷新/换设备不丢）")
 
-with colx:
-    if st.button("⬇️ 导出备份CSV"):
-        df_export = load_all_rows()
-        if df_export.empty:
-            st.sidebar.warning("当前没有可导出的数据。")
-        else:
-            st.download_button(
-                "点击下载",
-                data=df_export.to_csv(index=False).encode("utf-8-sig"),
-                file_name="bili_dashboard_backup.csv",
-                mime="text/csv"
-            )
+with st.sidebar.expander("备份/恢复", expanded=False):
+    df_export = load_all_rows()
+    if not df_export.empty:
+        st.download_button(
+            "⬇️ 导出备份CSV",
+            data=df_export.to_csv(index=False).encode("utf-8-sig"),
+            file_name="bili_dashboard_backup.csv",
+            mime="text/csv"
+        )
+    else:
+        st.caption("暂无数据可导出")
 
-with coly:
-    uploaded_backup = st.file_uploader("导入备份CSV恢复", type=["csv"], label_visibility="collapsed")
-    if uploaded_backup is not None and st.button("📥 恢复"):
+    uploaded_backup = st.file_uploader("导入备份CSV恢复", type=["csv"])
+    if uploaded_backup is not None and st.button("📥 恢复备份到数据库"):
         raw = uploaded_backup.getvalue()
         df_imp = None
         for enc in ["utf-8-sig", "utf-8", "gbk"]:
@@ -315,25 +310,24 @@ with coly:
             except Exception:
                 df_imp = None
         if df_imp is None:
-            st.sidebar.error("恢复失败：CSV读取失败（建议UTF-8编码）。")
+            st.error("恢复失败：CSV读取失败（建议UTF-8编码）。")
         else:
             df_imp = normalize_df(df_imp)
-            # 补全必须字段
             if "fetched_at" not in df_imp.columns:
                 df_imp["fetched_at"] = pd.Timestamp.now()
-            # 写库
             df_imp["pubdate"] = pd.to_datetime(df_imp["pubdate"], errors="coerce")
             df_imp["fetched_at"] = pd.to_datetime(df_imp["fetched_at"], errors="coerce").fillna(pd.Timestamp.now())
-            # 转成字符串入库
             df_imp["pubdate"] = df_imp["pubdate"].dt.strftime("%Y-%m-%d %H:%M:%S")
             df_imp["fetched_at"] = df_imp["fetched_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
             upsert_rows(df_imp)
-            st.sidebar.success("恢复完成（已写入数据库）。")
+            st.success("恢复完成（已写入数据库）。")
+            st.rerun()
 
 with st.sidebar.expander("危险操作：清空全部数据", expanded=False):
     if st.button("🗑️ 清空数据库（不可撤销）"):
         clear_all_data()
-        st.sidebar.success("已清空。刷新页面即可看到空数据。")
+        st.success("已清空。")
+        st.rerun()
 
 st.sidebar.divider()
 
@@ -395,12 +389,12 @@ if mode == "粘贴链接/BV采集":
 
         if rows:
             df_new = normalize_df(pd.DataFrame(rows))
-            # stringify datetime for DB
             df_new["pubdate"] = pd.to_datetime(df_new["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             df_new["fetched_at"] = pd.to_datetime(df_new["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             upsert_rows(df_new)
 
         st.sidebar.success(f"成功采集 {ok} 条，失败 {fail} 条（数据已保存）")
+        st.rerun()
 
 else:
     default_project = st.sidebar.text_input("缺少 project 列时：默认项目名", value="未命名项目")
@@ -433,12 +427,12 @@ else:
                 if "fetched_at" not in df_csv.columns:
                     df_csv["fetched_at"] = pd.Timestamp.now()
 
-                # stringify datetime for DB
                 df_csv["pubdate"] = pd.to_datetime(df_csv["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
                 df_csv["fetched_at"] = pd.to_datetime(df_csv["fetched_at"], errors="coerce").fillna(pd.Timestamp.now()).dt.strftime("%Y-%m-%d %H:%M:%S")
 
                 upsert_rows(df_csv)
                 st.sidebar.success(f"导入成功：{len(df_csv):,} 行（数据已保存）")
+                st.rerun()
 
 # =========================
 # Load data from DB (always)
@@ -455,7 +449,7 @@ if df_db.empty:
 df_db = compute_metrics(df_db)
 
 # =========================
-# Project filter: hide baseline project
+# Project filter (hide baseline project)
 # =========================
 projects = sorted([p for p in df_db["project"].dropna().unique().tolist() if str(p).strip() != "" and p != BASELINE_PROJECT])
 sel_projects = st.sidebar.multiselect("选择项目（筛选展示）", projects, default=projects if projects else None)
@@ -473,7 +467,7 @@ c3.metric("平均互动率", f"{df_f['engagement_rate'].mean()*100:.2f}%")
 c4.metric("深度信号占比(币+藏/互动)", f"{df_f['deep_signal_ratio'].mean()*100:.1f}%")
 
 # =========================
-# Cross project comparison
+# Cross project comparison + quadrant
 # =========================
 st.subheader("跨项目对比（项目之间谁更强、谁更稳）")
 
@@ -512,16 +506,14 @@ for proj, g in df_f.groupby("project"):
 
 proj_df = pd.DataFrame(proj_rows).sort_values("总播放", ascending=False)
 
-show_proj_cols = ["project","视频数","UP数","总播放","总互动","互动率中位数","深度信号中位数","互动率波动(IQR)","Top1播放贡献","Top3播放贡献"]
 st.dataframe(
-    proj_df[show_proj_cols]
-      .assign(**{
-          "互动率中位数": (proj_df["互动率中位数"]*100).map(lambda x: f"{x:.2f}%"),
-          "深度信号中位数": (proj_df["深度信号中位数"]*100).map(lambda x: f"{x:.1f}%"),
-          "互动率波动(IQR)": (proj_df["互动率波动(IQR)"]*100).map(lambda x: f"{x:.2f}pp"),
-          "Top1播放贡献": (proj_df["Top1播放贡献"]*100).map(lambda x: f"{x:.1f}%"),
-          "Top3播放贡献": (proj_df["Top3播放贡献"]*100).map(lambda x: f"{x:.1f}%"),
-      }),
+    proj_df.assign(**{
+        "互动率中位数": (proj_df["互动率中位数"]*100).map(lambda x: f"{x:.2f}%"),
+        "深度信号中位数": (proj_df["深度信号中位数"]*100).map(lambda x: f"{x:.1f}%"),
+        "互动率波动(IQR)": (proj_df["互动率波动(IQR)"]*100).map(lambda x: f"{x:.2f}pp"),
+        "Top1播放贡献": (proj_df["Top1播放贡献"]*100).map(lambda x: f"{x:.1f}%"),
+        "Top3播放贡献": (proj_df["Top3播放贡献"]*100).map(lambda x: f"{x:.1f}%"),
+    }),
     use_container_width=True,
     height=260
 )
@@ -545,23 +537,25 @@ if len(proj_df) >= 2:
     fig2.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
     st.plotly_chart(fig2, use_container_width=True)
 
-# =========================
-# KOL module (independent, uses baseline saved in DB)
-# =========================
 st.divider()
-st.subheader("KOL合作资料库（独立模块：数据也会保存，可跨设备查看）")
+
+# =========================================================
+# KOL module (independent) + DIAGNOSIS
+# =========================================================
+st.subheader("KOL合作资料库（独立模块：含诊断，避免只出1人）")
 
 all_projects = projects
 default_collab = sel_projects if sel_projects else all_projects
 
 with st.expander("KOL模块设置（默认即可）", expanded=False):
     collab_projects = st.multiselect("哪些项目算“合作项目”", all_projects, default=default_collab)
+
     baseline_pref = st.radio(
         "日常基准怎么取？",
         ["优先用非合作项目视频（更像‘日常’）", "用该UP在库里所有视频（更宽松）"],
-        index=0
+        index=1
     )
-    min_baseline_n = st.slider("基准最少需要多少条视频（太少不判定）", 3, 30, 6)
+    min_baseline_n = st.slider("基准最少需要多少条视频（太少不判定）", 1, 30, 3)
     extra_baseline_n = st.slider("自动补齐：每个KOL额外抓几条日常视频", 0, 10, 5)
     sleep_sec = st.slider("抓取间隔（防限流）", 0.2, 2.0, 0.8, step=0.1)
 
@@ -577,10 +571,17 @@ with cA:
 with cB:
     build_kol_btn = st.button("📚 生成/刷新KOL商务资料库")
 with cC:
-    st.caption("流程：选合作项目 →（可选）补齐日常样本 → 生成资料库 → 下载CSV做合作池")
+    st.caption("若结果只有1人：先看下面“诊断表”，通常是基准不足或CSV缺owner_mid导致无法抓样本。")
 
-if collab_projects:
+if not collab_projects:
+    st.info("请选择至少一个合作项目。")
+else:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
+
+    if collab_df.empty:
+        st.warning("合作项目下没有任何数据：请确认项目名是否与数据中的 project 完全一致。")
+    else:
+        st.caption(f"合作UP主数：{collab_df['owner_name'].nunique()}｜合作视频数：{len(collab_df)}")
 
     if fetch_baseline_btn:
         if collab_df.empty or extra_baseline_n <= 0:
@@ -588,10 +589,12 @@ if collab_projects:
         else:
             existed = set(df_db["bvid"].astype(str).tolist())
             rows_new = []
+            failed_no_mid = 0
 
             for up, g in collab_df.groupby("owner_name"):
                 mids = g["owner_mid"].dropna().unique().tolist()
                 if not mids:
+                    failed_no_mid += 1
                     continue
                 mid = int(mids[0])
 
@@ -615,166 +618,157 @@ if collab_projects:
                     except Exception:
                         continue
 
+            if failed_no_mid > 0:
+                st.warning(
+                    f"有 {failed_no_mid} 位UP缺少 owner_mid，无法自动抓日常样本。"
+                    "建议：用“链接/BV采集”方式采合作视频（会自动带owner_mid），或在CSV里补一列 owner_mid。"
+                )
+
             if rows_new:
                 df_new = normalize_df(pd.DataFrame(rows_new))
                 df_new["pubdate"] = pd.to_datetime(df_new["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
                 df_new["fetched_at"] = pd.to_datetime(df_new["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
                 upsert_rows(df_new)
-                st.success(f"已保存KOL日常样本：新增 {len(rows_new)} 条（不会出现在项目归档）")
+                st.success(f"已保存KOL日常样本：新增 {len(rows_new)} 条")
                 st.rerun()
             else:
                 st.warning("未抓到可新增的日常样本（可能限流/接口波动/样本已存在）。")
 
-    if build_kol_btn:
-        df_all = df_db.copy()
-        df_all = compute_metrics(df_all)
+    # ======== Diagnosis table ========
+    st.markdown("**KOL生成诊断（为什么只出少数结果，一眼看这里）**")
+    df_all = compute_metrics(df_db.copy())
+    diag_rows = []
 
-        collab_df2 = df_all[df_all["project"].isin(collab_projects)].copy()
-        if collab_df2.empty:
-            st.warning("合作项目下没有数据，无法生成资料库。")
+    for up, g_collab in collab_df.groupby("owner_name"):
+        collab_n = len(g_collab)
+        has_mid = g_collab["owner_mid"].notna().any()
+
+        hidden_base = df_all[(df_all["project"] == BASELINE_PROJECT) & (df_all["baseline_for"] == up)]
+        non_collab_base = df_all[
+            (df_all["owner_name"] == up)
+            & (~df_all["project"].isin(collab_projects))
+            & (df_all["project"] != BASELINE_PROJECT)
+        ]
+        all_base = df_all[df_all["owner_name"] == up]
+
+        if baseline_pref.startswith("优先用非合作"):
+            base_n = len(pd.concat([hidden_base, non_collab_base]).drop_duplicates(subset=["bvid"]))
         else:
-            rows = []
-            for up, g_collab in collab_df2.groupby("owner_name"):
-                base_hidden = df_all[(df_all["project"] == BASELINE_PROJECT) & (df_all["baseline_for"] == up)].copy()
+            base_n = len(pd.concat([hidden_base, all_base]).drop_duplicates(subset=["bvid"]))
 
-                if baseline_pref.startswith("优先用非合作"):
-                    base_non_collab = df_all[
-                        (df_all["owner_name"] == up)
-                        & (~df_all["project"].isin(collab_projects))
-                        & (df_all["project"] != BASELINE_PROJECT)
-                    ].copy()
-                    g_base = pd.concat([base_hidden, base_non_collab], ignore_index=True)
-                    if len(g_base) < min_baseline_n:
-                        g_base = pd.concat([base_hidden, df_all[df_all["owner_name"] == up]], ignore_index=True)
-                else:
-                    g_base = pd.concat([base_hidden, df_all[df_all["owner_name"] == up]], ignore_index=True)
+        if collab_n <= 0:
+            status = "无合作视频"
+        elif base_n < min_baseline_n:
+            status = f"基准不足({base_n}<{min_baseline_n})"
+        elif (not has_mid) and len(hidden_base) == 0:
+            status = "缺owner_mid且无已抓基准"
+        else:
+            status = "可生成"
 
-                g_base = g_base.drop_duplicates(subset=["bvid"], keep="last")
+        diag_rows.append({
+            "KOL/UP主": up,
+            "合作视频数": collab_n,
+            "基准视频数": base_n,
+            "是否有owner_mid": "有" if has_mid else "无",
+            "隐藏基准样本数": int(len(hidden_base)),
+            "状态": status
+        })
+
+    diag_df = pd.DataFrame(diag_rows).sort_values(["状态","合作视频数"], ascending=[True, False])
+    st.dataframe(diag_df, use_container_width=True, height=280)
+
+    # ======== Build KOL library ========
+    if build_kol_btn:
+        rows = []
+        collab_df2 = df_all[df_all["project"].isin(collab_projects)].copy()
+
+        for up, g_collab in collab_df2.groupby("owner_name"):
+            base_hidden = df_all[(df_all["project"] == BASELINE_PROJECT) & (df_all["baseline_for"] == up)].copy()
+
+            if baseline_pref.startswith("优先用非合作"):
+                base_non_collab = df_all[
+                    (df_all["owner_name"] == up)
+                    & (~df_all["project"].isin(collab_projects))
+                    & (df_all["project"] != BASELINE_PROJECT)
+                ].copy()
+                g_base = pd.concat([base_hidden, base_non_collab], ignore_index=True)
                 if len(g_base) < min_baseline_n:
-                    continue
-
-                base_view_med = float(g_base["view"].median())
-                base_er_med = float(g_base["engagement_rate"].median())
-                base_deep_med = float(g_base["deep_signal_ratio"].median())
-
-                base_view_mean = float(g_base["view"].mean())
-                base_view_std = float(g_base["view"].std(ddof=0)) if float(g_base["view"].std(ddof=0)) > 1e-9 else 0.0
-                base_er_mean = float(g_base["engagement_rate"].mean())
-                base_er_std = float(g_base["engagement_rate"].std(ddof=0)) if float(g_base["engagement_rate"].std(ddof=0)) > 1e-12 else 0.0
-                base_deep_mean = float(g_base["deep_signal_ratio"].mean())
-                base_deep_std = float(g_base["deep_signal_ratio"].std(ddof=0)) if float(g_base["deep_signal_ratio"].std(ddof=0)) > 1e-12 else 0.0
-
-                collab_view_med = float(g_collab["view"].median())
-                collab_er_med = float(g_collab["engagement_rate"].median())
-                collab_deep_med = float(g_collab["deep_signal_ratio"].median())
-
-                view_lift = (collab_view_med / base_view_med - 1.0) if base_view_med > 0 else np.nan
-                er_lift = (collab_er_med / base_er_med - 1.0) if base_er_med > 0 else np.nan
-                deep_lift = (collab_deep_med / base_deep_med - 1.0) if base_deep_med > 0 else np.nan
-
-                z_view = (collab_view_med - base_view_mean) / base_view_std if base_view_std > 0 else 0.0
-                z_er = (collab_er_med - base_er_mean) / base_er_std if base_er_std > 0 else 0.0
-                z_deep = (collab_deep_med - base_deep_mean) / base_deep_std if base_deep_std > 0 else 0.0
-
-                cond_view = (not np.isnan(view_lift)) and (view_lift >= lift_view_pct/100.0) and (z_view >= z_threshold)
-                cond_er = (not np.isnan(er_lift)) and (er_lift >= lift_er_pct/100.0) and (z_er >= z_threshold)
-                cond_deep = (not np.isnan(deep_lift)) and (deep_lift >= lift_deep_pct/100.0) and (z_deep >= z_threshold)
-
-                is_good = (cond_view and cond_er) if require_both else (cond_view or cond_er or cond_deep)
-
-                top3 = g_collab.sort_values("view", ascending=False).head(3)
-                top3_titles = "｜".join([str(t)[:30] for t in top3["title"].tolist()])
-                top3_links = "｜".join([f"https://www.bilibili.com/video/{b}" for b in top3["bvid"].tolist()])
-
-                # tags
-                collab_sorted = g_collab.sort_values("view", ascending=False)
-                total_view = float(collab_sorted["view"].sum())
-                top1_share = (float(collab_sorted.iloc[0]["view"]) / total_view) if total_view > 0 else 0.0
-                er_q1 = float(g_collab["engagement_rate"].quantile(0.25))
-                er_q3 = float(g_collab["engagement_rate"].quantile(0.75))
-                er_iqr = er_q3 - er_q1
-
-                tags = []
-                if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升型")
-                if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("强互动引爆")
-                if not np.isnan(deep_lift) and deep_lift >= 0.10: tags.append("价值沉淀型")
-                if top1_share >= 0.55: tags.append("头部依赖高")
-                if er_iqr >= float(g_collab["engagement_rate"].median()) * 0.8: tags.append("波动较大")
-                if not tags: tags.append("常规表现")
-
-                heat = "热度拉升" if (not np.isnan(view_lift) and view_lift >= 0.30) else "热度稳定"
-                interact = "互动强" if (not np.isnan(er_lift) and er_lift >= 0.20) else "互动常规"
-                depth = "沉淀强" if (not np.isnan(deep_lift) and deep_lift >= 0.10) else "沉淀一般"
-                risk = []
-                if "头部依赖高" in tags: risk.append("头部依赖")
-                if "波动较大" in tags: risk.append("波动")
-                persona = f"{heat} + {interact} + {depth}" + (f"（风险：{'/'.join(risk)}）" if risk else "")
-
-                if (not np.isnan(view_lift) and view_lift >= 0.30) and (not np.isnan(er_lift) and er_lift >= 0.20):
-                    scene = "大促节点/新品首发/热点借势"
-                    form = "首发测评/挑战赛/联合企划（带话题）"
-                    hook = "前3秒强卖点 + 互动任务（提问/投票） + 结尾投币收藏理由"
-                    avoid = "避免硬广直给，必须故事化/体验化"
-                elif (not np.isnan(deep_lift) and deep_lift >= 0.10):
-                    scene = "口碑向/种草向/长尾持续曝光"
-                    form = "系列化栏目/深度测评/清单向内容"
-                    hook = "可复看价值点 + 收藏引导 + 评论区置顶资料"
-                    avoid = "别用纯播放KPI考核；重点看收藏/投币/长尾"
-                else:
-                    scene = "低成本试水/补位投放"
-                    form = "单条软植入/素材共创/话题互动"
-                    hook = "围绕TA擅长结构（整活/测评/盘点）做轻合作"
-                    avoid = "不要重权益绑定，先1-2条验证再加码"
-
-                if "头部依赖高" in tags: avoid += "；建议AB备选选题"
-                if "波动较大" in tags: avoid += "；建议明确brief与资源位支持"
-                suggestion_bundle = f"适合场景：{scene}｜合作形式：{form}｜内容抓手：{hook}｜避坑：{avoid}"
-
-                if is_good and ("头部依赖高" not in tags) and ("波动较大" not in tags):
-                    advice = "优先续约/可加码：合作有明确增益，可争取更深权益/系列化"
-                elif is_good:
-                    advice = "可合作但控风险：建议AB选题+加强分发+明确转化KPI"
-                elif (not is_good) and (not np.isnan(deep_lift) and deep_lift >= 0.10):
-                    advice = "小众高质：适合垂类/口碑场景，不建议用纯播放KPI"
-                else:
-                    advice = "谨慎：先低成本试水或换选题/包装后再评估"
-
-                rows.append({
-                    "KOL/UP主": up,
-                    "标注": "⭐ 合作明显更好" if is_good else "",
-                    "标签": "、".join(tags),
-                    "KOL画像一句话": persona,
-                    "合作建议组合": suggestion_bundle,
-                    "商务建议": advice,
-                    "合作视频数": int(len(g_collab)),
-                    "基准视频数": int(len(g_base)),
-                    "合作播放中位数": collab_view_med,
-                    "日常播放中位数": base_view_med,
-                    "合作播放提升": view_lift,
-                    "合作互动率中位数": collab_er_med,
-                    "日常互动率中位数": base_er_med,
-                    "合作互动率提升": er_lift,
-                    "合作深度信号中位数": collab_deep_med,
-                    "日常深度信号中位数": base_deep_med,
-                    "深度信号提升": deep_lift,
-                    "证据-合作Top3标题": top3_titles,
-                    "证据-合作Top3链接": top3_links,
-                })
-
-            if not rows:
-                st.warning("KOL资料库生成失败：日常基准视频不足。建议先点“自动抓KOL日常样本”。")
+                    g_base = pd.concat([base_hidden, df_all[df_all["owner_name"] == up]], ignore_index=True)
             else:
-                lib = pd.DataFrame(rows)
-                lib["_flag"] = lib["标注"].apply(lambda x: 1 if str(x).strip() else 0)
-                lib = lib.sort_values(["_flag","合作互动率提升","合作播放提升"], ascending=[False, False, False]).drop(columns=["_flag"])
+                g_base = pd.concat([base_hidden, df_all[df_all["owner_name"] == up]], ignore_index=True)
 
-                st.dataframe(lib, use_container_width=True, height=420)
-                st.download_button(
-                    "⬇️ 下载KOL商务资料库（CSV）",
-                    data=lib.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="kol_business_library.csv",
-                    mime="text/csv"
-                )
+            g_base = g_base.drop_duplicates(subset=["bvid"], keep="last")
+            if len(g_base) < min_baseline_n:
+                continue
+
+            base_view_med = float(g_base["view"].median())
+            base_er_med = float(g_base["engagement_rate"].median())
+            base_deep_med = float(g_base["deep_signal_ratio"].median())
+
+            base_view_mean = float(g_base["view"].mean())
+            base_view_std = float(g_base["view"].std(ddof=0)) if float(g_base["view"].std(ddof=0)) > 1e-9 else 0.0
+            base_er_mean = float(g_base["engagement_rate"].mean())
+            base_er_std = float(g_base["engagement_rate"].std(ddof=0)) if float(g_base["engagement_rate"].std(ddof=0)) > 1e-12 else 0.0
+            base_deep_mean = float(g_base["deep_signal_ratio"].mean())
+            base_deep_std = float(g_base["deep_signal_ratio"].std(ddof=0)) if float(g_base["deep_signal_ratio"].std(ddof=0)) > 1e-12 else 0.0
+
+            collab_view_med = float(g_collab["view"].median())
+            collab_er_med = float(g_collab["engagement_rate"].median())
+            collab_deep_med = float(g_collab["deep_signal_ratio"].median())
+
+            view_lift = (collab_view_med / base_view_med - 1.0) if base_view_med > 0 else np.nan
+            er_lift = (collab_er_med / base_er_med - 1.0) if base_er_med > 0 else np.nan
+            deep_lift = (collab_deep_med / base_deep_med - 1.0) if base_deep_med > 0 else np.nan
+
+            z_view = (collab_view_med - base_view_mean) / base_view_std if base_view_std > 0 else 0.0
+            z_er = (collab_er_med - base_er_mean) / base_er_std if base_er_std > 0 else 0.0
+            z_deep = (collab_deep_med - base_deep_mean) / base_deep_std if base_deep_std > 0 else 0.0
+
+            cond_view = (not np.isnan(view_lift)) and (view_lift >= lift_view_pct/100.0) and (z_view >= z_threshold)
+            cond_er = (not np.isnan(er_lift)) and (er_lift >= lift_er_pct/100.0) and (z_er >= z_threshold)
+            cond_deep = (not np.isnan(deep_lift)) and (deep_lift >= lift_deep_pct/100.0) and (z_deep >= z_threshold)
+            is_good = (cond_view and cond_er) if require_both else (cond_view or cond_er or cond_deep)
+
+            top3 = g_collab.sort_values("view", ascending=False).head(3)
+            top3_titles = "｜".join([str(t)[:30] for t in top3["title"].tolist()])
+            top3_links = "｜".join([f"https://www.bilibili.com/video/{b}" for b in top3["bvid"].tolist()])
+
+            tags = []
+            if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升型")
+            if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("强互动引爆")
+            if not np.isnan(deep_lift) and deep_lift >= 0.10: tags.append("价值沉淀型")
+            if not tags: tags.append("常规表现")
+
+            heat = "热度拉升" if (not np.isnan(view_lift) and view_lift >= 0.30) else "热度稳定"
+            interact = "互动强" if (not np.isnan(er_lift) and er_lift >= 0.20) else "互动常规"
+            depth = "沉淀强" if (not np.isnan(deep_lift) and deep_lift >= 0.10) else "沉淀一般"
+            persona = f"{heat} + {interact} + {depth}"
+
+            suggestion_bundle = "适合场景：大促/口碑/试水｜合作形式：测评/系列/软植入｜内容抓手：前3秒卖点+互动任务+收藏理由｜避坑：避免硬广直给"
+
+            rows.append({
+                "KOL/UP主": up,
+                "标注": "⭐ 合作明显更好" if is_good else "",
+                "标签": "、".join(tags),
+                "KOL画像一句话": persona,
+                "合作建议组合": suggestion_bundle,
+                "合作视频数": int(len(g_collab)),
+                "基准视频数": int(len(g_base)),
+                "证据-合作Top3标题": top3_titles,
+                "证据-合作Top3链接": top3_links,
+            })
+
+        if not rows:
+            st.warning("没有生成任何KOL结果：请看上面的诊断表（大概率是基准不足/缺owner_mid）。")
+        else:
+            lib = pd.DataFrame(rows)
+            st.dataframe(lib, use_container_width=True, height=420)
+            st.download_button(
+                "⬇️ 下载KOL商务资料库（CSV）",
+                data=lib.to_csv(index=False).encode("utf-8-sig"),
+                file_name="kol_business_library.csv",
+                mime="text/csv"
+            )
 
 # =========================
 # Project table
