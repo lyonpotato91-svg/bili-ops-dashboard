@@ -12,10 +12,7 @@ st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
 # =========================
 # Utils
 # =========================
-REQUIRED_COLS_MIN = ["bvid", "title", "owner_name", "pubdate", "view", "like", "coin", "favorite", "reply", "project"]
-
 NUM_COLS = ["view", "like", "coin", "favorite", "reply", "danmaku", "share", "fans_delta"]
-OPTIONAL_COLS = ["danmaku", "share", "fans_delta", "owner_mid", "fetched_at", "url"]
 
 def parse_bvid(url_or_bv: str) -> str | None:
     s = (url_or_bv or "").strip()
@@ -53,7 +50,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df.columns = [str(c).strip() for c in df.columns]
-    col_map_lower = {c.lower(): c for c in df.columns}
 
     zh_alias = {
         "项目": "project",
@@ -92,26 +88,32 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns=rename)
 
+    # If url exists but bvid missing, try parse
     if "bvid" not in df.columns and "url" in df.columns:
         df["bvid"] = df["url"].apply(parse_bvid)
 
+    # If bvid exists but has URLs inside, parse them
     if "bvid" in df.columns:
         df["bvid"] = df["bvid"].apply(lambda x: parse_bvid(x) if isinstance(x, str) else x)
         df["bvid"] = df["bvid"].apply(lambda x: _safe_str(x))
 
+    # Ensure required text cols exist
     for col in ["project", "title", "owner_name"]:
         if col not in df.columns:
             df[col] = ""
 
+    # Dates
     if "pubdate" not in df.columns:
         df["pubdate"] = pd.NaT
     df["pubdate"] = df["pubdate"].apply(_safe_date)
 
+    # Numerics
     for col in NUM_COLS:
         if col not in df.columns:
             df[col] = 0
         df[col] = df[col].apply(_safe_int)
 
+    # fetched_at
     if "fetched_at" not in df.columns:
         df["fetched_at"] = pd.Timestamp.now()
     else:
@@ -123,6 +125,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     existing = [c for c in df.columns if c in keep]
     df = df[existing].copy()
 
+    # best-effort filter valid BV
     if "bvid" in df.columns:
         df = df[df["bvid"].astype(str).str.startswith("BV")]
 
@@ -149,6 +152,9 @@ def label_vs_baseline(value: float, baseline_mean: float, baseline_std: float) -
     if z <= -1.0:
         return "低于预期"
     return "正常发挥"
+
+def _pct(x: float, digits=2):
+    return f"{x*100:.{digits}f}%"
 
 # =========================
 # B站抓取（链接/BV采集）
@@ -257,7 +263,7 @@ if mode == "粘贴链接/BV采集":
                 row["url"] = it
                 rows.append(row)
                 ok += 1
-                time.sleep(0.4)
+                time.sleep(0.4)  # 放慢，降低被限流概率
             except Exception:
                 fail += 1
 
@@ -327,11 +333,10 @@ c3.metric("平均互动率", f"{df_f['engagement_rate'].mean()*100:.2f}%")
 c4.metric("深度信号占比(币+藏/互动)", f"{df_f['deep_signal_ratio'].mean()*100:.1f}%")
 
 # =========================================================
-# ✅ 新增：跨项目对比（排行榜 + 四象限）
+# ✅ 跨项目对比（排行榜 + 四象限）
 # =========================================================
 st.subheader("跨项目对比（项目之间谁更强、谁更稳）")
 
-# 项目汇总：用“中位数”作为典型水平（更抗异常点），同时保留总量指标
 proj_rows = []
 for proj, g in df_f.groupby("project"):
     g2 = g.sort_values("view", ascending=False).copy()
@@ -340,16 +345,13 @@ for proj, g in df_f.groupby("project"):
     video_cnt = int(len(g2))
     up_cnt = int(g2["owner_name"].nunique()) if "owner_name" in g2.columns else 0
 
-    # 典型水平（中位数）
     er_med = float(g2["engagement_rate"].median())
     deep_med = float(g2["deep_signal_ratio"].median())
 
-    # 波动（用IQR衡量稳定性）
     er_q1 = float(g2["engagement_rate"].quantile(0.25))
     er_q3 = float(g2["engagement_rate"].quantile(0.75))
     er_iqr = er_q3 - er_q1
 
-    # Top视频贡献（头部依赖程度）
     top1_view = int(g2.iloc[0]["view"]) if video_cnt > 0 else 0
     top3_view = int(g2.head(3)["view"].sum()) if video_cnt > 0 else 0
     top1_share = (top1_view / total_view) if total_view > 0 else 0.0
@@ -370,7 +372,6 @@ for proj, g in df_f.groupby("project"):
 
 proj_df = pd.DataFrame(proj_rows).sort_values("总播放", ascending=False)
 
-# 展示排行榜表
 show_proj_cols = ["project","视频数","UP数","总播放","总互动","互动率中位数","深度信号中位数","互动率波动(IQR)","Top1播放贡献","Top3播放贡献"]
 st.dataframe(
     proj_df[show_proj_cols]
@@ -385,7 +386,6 @@ st.dataframe(
     height=260
 )
 
-# 四象限图：X=互动率中位数，Y=深度信号中位数
 st.markdown("**项目四象限（X=互动率中位数，Y=深度信号中位数）**")
 if len(proj_df) >= 2:
     x_med = float(proj_df["互动率中位数"].median())
@@ -399,15 +399,12 @@ if len(proj_df) >= 2:
         hover_data=["视频数","UP数","总播放","Top1播放贡献","Top3播放贡献","互动率波动(IQR)"],
         text="project",
     )
-    # 参考线（全局中位数）
     fig2.add_vline(x=x_med, line_dash="dash")
     fig2.add_hline(y=y_med, line_dash="dash")
-
     fig2.update_traces(textposition="top center")
     fig2.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
     st.plotly_chart(fig2, use_container_width=True)
 
-    # 自动结论（偏运营口吻）
     st.markdown("**项目解读（可直接写进周报）**")
     bullets = []
     for _, r in proj_df.iterrows():
@@ -417,7 +414,6 @@ if len(proj_df) >= 2:
         top1 = r["Top1播放贡献"]
         iqr = r["互动率波动(IQR)"]
 
-        # 象限判断
         if er >= x_med and deep >= y_med:
             tag = "又热又沉淀（优先加码）"
         elif er >= x_med and deep < y_med:
@@ -427,11 +423,10 @@ if len(proj_df) >= 2:
         else:
             tag = "偏弱（重点复盘选题&包装&分发）"
 
-        # 头部依赖&稳定性补充
         extra = []
         if top1 >= 0.45:
             extra.append("头部依赖高（Top1贡献偏大，需补中腰部）")
-        if iqr >= (proj_df["互动率波动(IQR)"].median() if len(proj_df) > 0 else iqr):
+        if len(proj_df) > 0 and iqr >= float(proj_df["互动率波动(IQR)"].median()):
             extra.append("波动较大（内容/分发不稳定）")
 
         extra_txt = f"；{ '；'.join(extra) }" if extra else ""
@@ -444,8 +439,145 @@ else:
 
 st.divider()
 
+# =========================================================
+# ✅ 新增：KOL合作效果标注（合作视频明显强于其日常）
+# =========================================================
+st.subheader("KOL合作效果标注（为未来合作资料库做储备）")
+
+all_projects = sorted([p for p in df["project"].dropna().unique().tolist() if str(p).strip() != ""])
+default_collab = sel_projects if sel_projects else all_projects
+
+with st.expander("设置：如何判定“合作明显更好”（可不改，默认就能用）", expanded=False):
+    collab_projects = st.multiselect("哪些项目算“合作项目”", all_projects, default=default_collab)
+    baseline_mode = st.radio(
+        "日常基准怎么取？",
+        ["优先用“非合作项目”的视频作为基准（推荐）", "直接用该UP在你库里的所有视频作为基准"],
+        index=0
+    )
+    min_baseline_n = st.slider("基准最少需要多少条视频（太少不判定）", 3, 30, 6)
+    lift_view_pct = st.slider("合作播放提升阈值（相对基准中位数）", 0, 300, 30, step=5)  # %
+    lift_er_pct = st.slider("合作互动率提升阈值（相对基准中位数）", 0, 300, 20, step=5)   # %
+    z_threshold = st.slider("Z分数阈值（用于“明显更好”标注）", 0.0, 3.0, 1.0, step=0.1)
+    require_both = st.checkbox("更严格：播放&互动率都要明显更好才标注", value=False)
+
+# 如果用户一个都没选，就不计算
+if not collab_projects:
+    st.info("请先在设置里选择至少一个“合作项目”。")
+else:
+    df_all = df.copy()
+    df_all = df_all[df_all["owner_name"].astype(str).str.strip() != ""].copy()
+
+    collab_df = df_all[df_all["project"].isin(collab_projects)].copy()
+
+    if collab_df.empty:
+        st.info("当前选择的合作项目下没有视频数据。")
+    else:
+        # baseline: per UP
+        rows = []
+        for up, g_collab in collab_df.groupby("owner_name"):
+            # baseline selection
+            if baseline_mode.startswith("优先用"):
+                g_base = df_all[(df_all["owner_name"] == up) & (~df_all["project"].isin(collab_projects))].copy()
+                # 如果非合作基准太少，兜底用全库
+                if len(g_base) < min_baseline_n:
+                    g_base = df_all[df_all["owner_name"] == up].copy()
+            else:
+                g_base = df_all[df_all["owner_name"] == up].copy()
+
+            # 基准数量检查
+            if len(g_base) < min_baseline_n:
+                continue
+
+            # metrics
+            base_view_med = float(g_base["view"].median())
+            base_er_med = float(g_base["engagement_rate"].median())
+            base_view_mean = float(g_base["view"].mean())
+            base_view_std = float(g_base["view"].std(ddof=0)) if float(g_base["view"].std(ddof=0)) > 1e-9 else 0.0
+            base_er_mean = float(g_base["engagement_rate"].mean())
+            base_er_std = float(g_base["engagement_rate"].std(ddof=0)) if float(g_base["engagement_rate"].std(ddof=0)) > 1e-12 else 0.0
+
+            collab_view_med = float(g_collab["view"].median())
+            collab_er_med = float(g_collab["engagement_rate"].median())
+
+            # lifts (relative to baseline median)
+            view_lift = (collab_view_med / base_view_med - 1.0) if base_view_med > 0 else np.nan
+            er_lift = (collab_er_med / base_er_med - 1.0) if base_er_med > 0 else np.nan
+
+            # z-score using baseline mean/std
+            z_view = (collab_view_med - base_view_mean) / base_view_std if base_view_std > 0 else 0.0
+            z_er = (collab_er_med - base_er_mean) / base_er_std if base_er_std > 0 else 0.0
+
+            # decide "明显更好"
+            cond_view = (not np.isnan(view_lift)) and (view_lift >= lift_view_pct / 100.0) and (z_view >= z_threshold)
+            cond_er = (not np.isnan(er_lift)) and (er_lift >= lift_er_pct / 100.0) and (z_er >= z_threshold)
+
+            if require_both:
+                is_good = cond_view and cond_er
+            else:
+                is_good = cond_view or cond_er
+
+            # top collab videos titles
+            g_top = g_collab.sort_values("view", ascending=False).head(3)
+            top_titles = "｜".join([str(t)[:30] for t in g_top["title"].tolist()])
+
+            rows.append({
+                "KOL/UP主": up,
+                "合作视频数": int(len(g_collab)),
+                "基准视频数": int(len(g_base)),
+                "合作播放中位数": collab_view_med,
+                "日常播放中位数": base_view_med,
+                "合作播放提升": view_lift,
+                "合作互动率中位数": collab_er_med,
+                "日常互动率中位数": base_er_med,
+                "合作互动率提升": er_lift,
+                "Z(播放)": z_view,
+                "Z(互动率)": z_er,
+                "标注": "⭐ 合作明显更好" if is_good else "",
+                "合作Top3视频标题": top_titles
+            })
+
+        if not rows:
+            st.info("暂无满足“基准视频数量”条件的KOL可计算（可降低基准最少条数或补充更多日常视频数据）。")
+        else:
+            kol_df = pd.DataFrame(rows)
+
+            # 排序：先标注、再按互动率提升、再按播放提升
+            kol_df["_flag"] = kol_df["标注"].apply(lambda x: 1 if str(x).strip() else 0)
+            kol_df = kol_df.sort_values(["_flag", "合作互动率提升", "合作播放提升"], ascending=[False, False, False]).drop(columns=["_flag"])
+
+            # 展示用格式化
+            show = kol_df.copy()
+            show["合作播放中位数"] = show["合作播放中位数"].map(lambda x: f"{int(x):,}")
+            show["日常播放中位数"] = show["日常播放中位数"].map(lambda x: f"{int(x):,}")
+            show["合作播放提升"] = show["合作播放提升"].map(lambda x: "-" if pd.isna(x) else f"{x*100:.1f}%")
+            show["合作互动率中位数"] = show["合作互动率中位数"].map(lambda x: f"{x*100:.2f}%")
+            show["日常互动率中位数"] = show["日常互动率中位数"].map(lambda x: f"{x*100:.2f}%")
+            show["合作互动率提升"] = show["合作互动率提升"].map(lambda x: "-" if pd.isna(x) else f"{x*100:.1f}%")
+            show["Z(播放)"] = show["Z(播放)"].map(lambda x: f"{x:.2f}")
+            show["Z(互动率)"] = show["Z(互动率)"].map(lambda x: f"{x:.2f}")
+
+            st.markdown("**标注逻辑：当合作表现相对该UP日常基准显著提升（提升阈值 + Z分数阈值）时，打上“⭐ 合作明显更好”。**")
+            st.dataframe(show, use_container_width=True, height=360)
+
+            # 下载：KOL资料库
+            export = kol_df.copy()
+            export["合作播放提升"] = export["合作播放提升"].fillna(0.0)
+            export["合作互动率提升"] = export["合作互动率提升"].fillna(0.0)
+            out_bytes = export.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("⬇️ 下载KOL合作效果资料库（CSV）", data=out_bytes, file_name="kol_collab_performance_library.csv", mime="text/csv")
+
+            # 简短结论
+            flagged = kol_df[kol_df["标注"].astype(str).str.contains("⭐")]
+            if not flagged.empty:
+                tops = flagged.head(5)["KOL/UP主"].tolist()
+                st.success(f"已标注 {len(flagged)} 位“合作明显更好”的KOL。优先关注：{ '、'.join(tops) }")
+            else:
+                st.warning("当前阈值下暂无“合作明显更好”的KOL。你可以在上方设置里适当降低提升阈值或Z阈值。")
+
+st.divider()
+
 # =========================
-# Table
+# 项目内视频表
 # =========================
 st.subheader("项目内视频表现（按播放排序）")
 show_cols = [
