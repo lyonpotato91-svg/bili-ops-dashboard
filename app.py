@@ -234,7 +234,6 @@ def perf_label(value: float, baseline_values: np.ndarray, ratio_hi: float, ratio
 
 def _sort_owner_hist(df_owner: pd.DataFrame) -> pd.DataFrame:
     g = df_owner.copy()
-    # 优先 pubdate 排序，缺失用 fetched_at 兜底
     g["__sort_time"] = g["pubdate"]
     missing = g["__sort_time"].isna()
     g.loc[missing, "__sort_time"] = g.loc[missing, "fetched_at"]
@@ -316,6 +315,39 @@ def fetch_recent_bvids_by_mid(mid: int, n: int = 20) -> list[str]:
         if bvid:
             out.append(bvid)
     return out
+
+# =========================
+# KOL 标注逻辑（核心：合作 vs 平时）
+# =========================
+def kol_flag(view_lift: float | None, er_lift: float | None, deep_lift: float | None) -> str:
+    """
+    返回“标注”列的内容：
+    - ⭐ 合作明显更好：任一维度达到阈值
+    - ⚠️ 合作偏弱：明显低于平时（尽量不写太难看）
+    - 空：正常区间
+    """
+    # 空值处理
+    def _v(x):
+        try:
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    v = _v(view_lift)
+    e = _v(er_lift)
+    d = _v(deep_lift)
+
+    # ⭐：正向明显
+    if (v is not None and v >= 0.30) or (e is not None and e >= 0.20) or (d is not None and d >= 0.10):
+        return "⭐ 合作明显更好"
+
+    # ⚠️：偏弱（阈值适当保守）
+    if (v is not None and v <= -0.20) or (e is not None and e <= -0.15):
+        return "⚠️ 合作偏弱"
+
+    return ""
 
 # =========================
 # Sidebar - global settings
@@ -617,12 +649,10 @@ insights = [
 st.write("\n".join(insights))
 
 # =========================================================
-# KOL module (optimized)
-# - No "use-case suggestion"
-# - Baseline diagnosis based on DB count only
+# KOL module (ADD 标注)
 # =========================================================
 st.divider()
-st.subheader("KOL合作资料库（独立模块：对比该KOL自身历史表现，不按时间）")
+st.subheader("KOL合作资料库（独立模块：标注合作是否优于平时）")
 
 with st.expander("KOL模块设置", expanded=False):
     collab_projects = st.multiselect("哪些项目算合作项目", projects, default=sel_projects if sel_projects else projects)
@@ -633,9 +663,9 @@ cA, cB, cC = st.columns([1,1,2])
 with cA:
     btn_fill_all = st.button("🧲 一键补齐所有合作KOL的历史视频到库（推荐）")
 with cB:
-    btn_build_kol = st.button("📚 生成KOL对比表")
+    btn_build_kol = st.button("📚 生成KOL对比表（含标注）")
 with cC:
-    st.caption("注意：基准不足只表示“库里该UP视频条数不够”，和TA是否近期更新无关。先补齐视频再生成。")
+    st.caption("标注：⭐ 合作明显更好 / ⚠️ 合作偏弱（保守阈值）/ 空=正常区间。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
@@ -691,13 +721,12 @@ if collab_projects:
         else:
             st.warning("本次未新增（可能已存在/限流/接口波动）。")
 
-    # ---- Diagnosis: baseline availability (DB count only) ----
-    st.markdown("**KOL基准诊断（只看库里该UP的视频条数是否足够）**")
+    # ---- Diagnosis ----
+    st.markdown("**KOL基准诊断（只看库内该UP视频条数是否足够）**")
     diag = []
     for up, g in collab_df.groupby("owner_name"):
-        owner_all = df_db[df_db["owner_name"] == up].copy()
-        owner_all = _sort_owner_hist(owner_all)
-        available = int(min(len(owner_all[owner_all["bvid"].notna()]), baseline_window_n))
+        owner_all = _sort_owner_hist(df_db[df_db["owner_name"] == up].copy())
+        available = int(min(len(owner_all), baseline_window_n))
         diag.append({
             "KOL/UP主": up,
             "库内视频总数": int(len(owner_all)),
@@ -708,18 +737,16 @@ if collab_projects:
     diag_df = pd.DataFrame(diag).sort_values(["状态","库内视频总数"], ascending=[True, False])
     st.dataframe(diag_df, use_container_width=True, height=280)
 
-    # ---- Build KOL compare table (collab vs own baseline) ----
+    # ---- Build KOL compare table (ADD 标注) ----
     if btn_build_kol:
         df_all_m = compute_metrics(df_db.copy())
         rows = []
 
         for up, g_collab in df_all_m[df_all_m["project"].isin(collab_projects)].groupby("owner_name"):
-            owner_all = df_all_m[df_all_m["owner_name"] == up].copy()
-            owner_all = _sort_owner_hist(owner_all)
+            owner_all = _sort_owner_hist(df_all_m[df_all_m["owner_name"] == up].copy())
 
-            # baseline = owner's latest N videos excluding current合作项目的视频（更像“平时水平”）
+            # baseline = owner's latest N videos excluding collab projects + include __BASELINE__
             base_pool = owner_all[~owner_all["project"].isin(set(collab_projects))].copy()
-            # 再加上 __BASELINE__（本质也是该UP的平时视频）
             base_pool = pd.concat([base_pool, owner_all[owner_all["project"] == BASELINE_PROJECT]], ignore_index=True)
             base_pool = base_pool.drop_duplicates(subset=["bvid"], keep="last")
             base_pool = _sort_owner_hist(base_pool).head(baseline_window_n)
@@ -739,6 +766,8 @@ if collab_projects:
             er_lift = (collab_er / base_er - 1.0) if base_er > 0 else np.nan
             deep_lift = (collab_deep / base_deep - 1.0) if base_deep > 0 else np.nan
 
+            mark = kol_flag(view_lift, er_lift, deep_lift)
+
             tags = []
             if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升")
             if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("互动增强")
@@ -749,6 +778,7 @@ if collab_projects:
 
             rows.append({
                 "KOL/UP主": up,
+                "标注": mark,
                 "合作视频数": int(len(g_collab)),
                 "基准样本数": int(len(base_pool)),
                 "标签": "、".join(tags),
@@ -771,7 +801,8 @@ if collab_projects:
             st.warning("没有生成KOL结果：请先“一键补齐”让库内该UP视频条数足够。")
         else:
             lib = pd.DataFrame(rows)
-            # 排序：先看播放提升，再看互动率提升
+
+            # 排序：先把“合作明显更好”放前面，然后看播放/互动提升
             def _pct_to_float(x):
                 try:
                     if x == "-" or pd.isna(x):
@@ -779,9 +810,11 @@ if collab_projects:
                     return float(str(x).replace("%",""))
                 except Exception:
                     return -999
+
+            lib["_flag"] = lib["标注"].apply(lambda s: 2 if str(s).startswith("⭐") else (1 if str(s).startswith("⚠️") else 0))
             lib["_view"] = lib["播放提升"].map(_pct_to_float)
             lib["_er"] = lib["互动率提升"].map(_pct_to_float)
-            lib = lib.sort_values(["_view","_er"], ascending=False).drop(columns=["_view","_er"])
+            lib = lib.sort_values(["_flag","_view","_er"], ascending=[False, False, False]).drop(columns=["_flag","_view","_er"])
 
             st.dataframe(lib, use_container_width=True, height=420)
             st.download_button(
