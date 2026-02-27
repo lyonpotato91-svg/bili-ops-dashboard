@@ -526,16 +526,6 @@ df_main = df_db[df_db["project"] != BASELINE_PROJECT].copy()
 df_f = df_main[df_main["project"].isin(sel_projects)].copy() if sel_projects else df_main.copy()
 
 # =========================
-# 周报项目选择（新增：只针对单项目输出）
-# =========================
-st.sidebar.markdown("#### 周报输出")
-weekly_project = st.sidebar.selectbox(
-    "选择一个项目用于周报解读（只输出该项目）",
-    options=projects if projects else ["(无项目)"],
-    index=0 if projects else 0
-)
-
-# =========================
 # Add performance labels (用于表格/TopBottom)
 # =========================
 df_f = add_perf_cols(df_f, df_db, baseline_window_n, baseline_min_n)
@@ -620,13 +610,12 @@ if len(proj_df) >= 2:
     st.plotly_chart(fig_q, use_container_width=True)
 
 # =========================
-# ✅ 新增：四象限下方的“跨项目解读”
+# ✅ 跨项目解读（四象限下方，项目对比）
 # =========================
-st.subheader("跨项目解读（放在四象限下面，便于周报引用）")
+st.subheader("跨项目解读（四象限下方：用于对比不同项目）")
 if proj_df.empty:
     st.info("暂无项目数据可解读。")
 else:
-    # 取几个维度用于描述“强/稳/风险”
     p = proj_df.copy()
     p["er"] = p["互动率中位数"]
     p["deep"] = p["深度信号中位数"]
@@ -634,19 +623,15 @@ else:
     p["top1"] = p["Top1播放贡献"]
     p["top3"] = p["Top3播放贡献"]
 
-    # 更强：互动率&深度都高（四象限右上）
-    # 更稳：IQR小
-    # 风险：Top1贡献过高 / IQR过大
     strongest = p.sort_values(["er","deep"], ascending=False).head(1).iloc[0]
     steadiest = p.sort_values(["iqr","er"], ascending=[True, False]).head(1).iloc[0]
     risky = p.sort_values(["top1","iqr"], ascending=False).head(1).iloc[0]
 
     lines = []
-    lines.append(f"1）**整体结构**：当前项目在四象限中呈现“差异化分布”——既有偏互动型项目，也有偏沉淀型项目，适合采用不同的内容打法与目标KPI。")
-    lines.append(f"2）**更强项目（互动&沉淀综合更靠前）**：{strongest['project']}（互动率中位数 {strongest['er']*100:.2f}%，深度信号中位数 {strongest['deep']*100:.1f}%），建议延续该项目的选题/包装方式并进一步模板化。")
-    lines.append(f"3）**更稳项目（波动更小）**：{steadiest['project']}（互动率波动IQR {steadiest['iqr']*100:.2f}pp），说明输出一致性更强，适合稳定节奏/持续投放与系列化。")
-    lines.append(f"4）**结构风险提示**：{risky['project']} 的Top1播放贡献 {risky['top1']*100:.1f}%（Top3贡献 {risky['top3']*100:.1f}%），存在“头部依赖”倾向，建议补齐腰部内容密度，降低单点波动。")
-
+    lines.append("1）整体结构：当前项目在四象限中呈现差异化分布，可采用不同内容打法与KPI重点。")
+    lines.append(f"2）更强项目（互动&沉淀更靠前）：{strongest['project']}（互动率中位数 {strongest['er']*100:.2f}%，深度信号中位数 {strongest['deep']*100:.1f}%）。")
+    lines.append(f"3）更稳项目（波动更小）：{steadiest['project']}（互动率波动IQR {steadiest['iqr']*100:.2f}pp），适合稳定节奏与系列化。")
+    lines.append(f"4）结构风险提示：{risky['project']} Top1播放贡献 {risky['top1']*100:.1f}%（Top3 {risky['top3']*100:.1f}%），存在头部依赖倾向，建议补齐腰部内容密度降低单点波动。")
     st.write("\n".join(lines))
 
 # =========================
@@ -696,43 +681,50 @@ fig = px.box(df_f, x="project", y="engagement_rate", points="all", hover_data=["
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ 新增：周报解读（只针对单个项目）
+# ✅ 周报结论（逐项目输出：只评判项目内，不混在一起）
 # =========================
-st.subheader("周报解读（只输出单个项目，可直接复制）")
+st.subheader("周报结论（逐项目输出：只评判项目内）")
 
-if weekly_project and weekly_project in df_f["project"].unique():
-    wk = df_f[df_f["project"] == weekly_project].copy()
-    wk = wk.sort_values("view", ascending=False)
-    total_view = int(wk["view"].sum())
-    total_eng = int(wk["engagement"].sum())
-    er_med = float(wk["engagement_rate"].median())
-    deep_med = float(wk["deep_signal_ratio"].median())
-    video_cnt = int(len(wk))
-    up_cnt = int(wk["owner_name"].nunique())
-
-    top = wk.iloc[0]
-    bottom = wk.iloc[-1]
-
-    # 风险/结构：头部依赖
-    top1_share = float(top["view"]) / total_view if total_view > 0 else 0.0
-    top3_share = float(wk.head(3)["view"].sum()) / total_view if total_view > 0 else 0.0
-
-    # 波动：互动率IQR
-    er_iqr = float(wk["engagement_rate"].quantile(0.75) - wk["engagement_rate"].quantile(0.25))
-
-    out = []
-    out.append(f"【项目：{weekly_project}】本期共产出 {video_cnt} 条内容，覆盖 {up_cnt} 位UP，累计播放 {total_view:,}，累计互动 {total_eng:,}。")
-    out.append(f"互动质量保持稳定：互动率中位数 {er_med*100:.2f}%（波动IQR {er_iqr*100:.2f}pp），深度信号中位数 {deep_med*100:.1f}%（币+藏占互动比）。")
-    out.append(f"最高播放由《{top['title']}》贡献（{int(top['view']):,} 播放，互动率 {top['engagement_rate']*100:.2f}%），验证该选题/包装具备可复制的流量抓手。")
-    out.append(f"最低播放《{bottom['title']}》为 {int(bottom['view']):,} 播放（互动率 {bottom['engagement_rate']*100:.2f}%），建议在封面/标题信息密度与评论区互动引导上做轻量优化，提升基础盘。")
-    out.append(f"结构观察：Top1播放贡献 {top1_share*100:.1f}%（Top3贡献 {top3_share*100:.1f}%），后续将通过复用高表现模板+补齐腰部内容，降低单点波动、稳定放大项目产出。")
-
-    st.write("\n".join(out))
+projects_for_weekly = sel_projects if (sel_projects and len(sel_projects) > 0) else projects
+if not projects_for_weekly:
+    st.info("暂无项目可输出周报结论。")
 else:
-    st.info("请选择一个有效项目用于周报输出。")
+    blocks = []
+    idx = 1
+    for proj in projects_for_weekly:
+        wk = df_f[df_f["project"] == proj].copy()
+        if wk.empty:
+            continue
+        wk = wk.sort_values("view", ascending=False)
+
+        total_view = int(wk["view"].sum())
+        total_eng = int(wk["engagement"].sum())
+        er_med = float(wk["engagement_rate"].median())
+        deep_med = float(wk["deep_signal_ratio"].median())
+        video_cnt = int(len(wk))
+        up_cnt = int(wk["owner_name"].nunique())
+
+        top = wk.iloc[0]
+        bottom = wk.iloc[-1]
+        top1_share = float(top["view"]) / total_view if total_view > 0 else 0.0
+        top3_share = float(wk.head(3)["view"].sum()) / total_view if total_view > 0 else 0.0
+        er_iqr = float(wk["engagement_rate"].quantile(0.75) - wk["engagement_rate"].quantile(0.25))
+
+        lines = []
+        lines.append(f"项目{idx}｜【{proj}】")
+        lines.append(f"- 产出与规模：{video_cnt} 条内容 / {up_cnt} 位UP，累计播放 {total_view:,}，累计互动 {total_eng:,}。")
+        lines.append(f"- 互动质量：互动率中位数 {er_med*100:.2f}%（波动IQR {er_iqr*100:.2f}pp），深度信号中位数 {deep_med*100:.1f}%。")
+        lines.append(f"- 高表现样本：最高播放《{top['title']}》{int(top['view']):,} 播放，互动率 {top['engagement_rate']*100:.2f}%，具备可复用抓手。")
+        lines.append(f"- 待优化样本：最低播放《{bottom['title']}》{int(bottom['view']):,} 播放，建议从封面/标题信息密度与评论区互动引导做轻量优化，抬升底盘。")
+        lines.append(f"- 结构观察：Top1贡献 {top1_share*100:.1f}%（Top3 {top3_share*100:.1f}%），后续通过复用高表现模板+补齐腰部内容，降低单点波动。")
+
+        blocks.append("\n".join(lines))
+        idx += 1
+
+    st.write("\n\n".join(blocks))
 
 # =========================
-# 保留：全局自动解读（原模块不删）
+# 保留：全局自动解读（原模块保留）
 # =========================
 st.subheader("全局自动解读（原模块保留）")
 best = df_f.sort_values("view", ascending=False).iloc[0]
@@ -760,6 +752,7 @@ with st.expander("KOL模块设置", expanded=False):
     collab_projects = st.multiselect("哪些项目算合作项目", projects, default=sel_projects if sel_projects else projects)
     fetch_n = st.slider("补齐基准：每个KOL抓取最近N条公开视频", 10, 80, 30, step=5)
     sleep_sec = st.slider("抓取间隔（防限流）", 0.2, 2.0, 0.8, step=0.1)
+    show_kol_quality_hint = st.checkbox("显示数据质量提示（缺mid/异常mid）", value=False)
 
 cA, cB, cC = st.columns([1, 1, 2])
 with cA:
@@ -771,23 +764,35 @@ with cC:
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
-    collab_df["owner_mid"] = collab_df["owner_mid"].apply(_norm_mid)
 
+    # 用原始owner_mid做一次质量检查（不被_norm_mid吞掉）
+    raw_mid = collab_df["owner_mid"].copy()
+    raw_mid_str = raw_mid.astype(str).fillna("").str.strip()
+    bad_mask = raw_mid_str.eq("") | raw_mid_str.str.contains(r"\D", regex=True) | raw_mid_str.str.len().gt(12)
+
+    # 用规范化mid用于实际逻辑
+    collab_df["owner_mid"] = collab_df["owner_mid"].apply(_norm_mid)
     valid_mid_df = collab_df[collab_df["owner_mid"].astype(str).str.len() > 0].copy()
-    invalid_mid_cnt = int((collab_df["owner_mid"].astype(str).str.len() == 0).sum())
 
     st.caption(f"合作UP主数：{collab_df['owner_mid'].nunique()}（含缺/异常mid）｜可抓取mid的UP数：{valid_mid_df['owner_mid'].nunique()}｜合作视频数：{len(collab_df)}")
-    if invalid_mid_cnt > 0:
-        st.warning(f"有 {invalid_mid_cnt} 条合作视频 owner_mid 缺失或异常（超长/非数字）。建议修CSV mid 或用BV采集补齐。")
+
+    # ✅ 默认不提示；需要时才展开，并列出具体是哪几条
+    if show_kol_quality_hint:
+        bad_rows = df_db[df_db.index.isin(collab_df.index)].copy()
+        bad_rows = bad_rows[bad_mask.values].copy()
+        if not bad_rows.empty:
+            st.warning(f"发现 {len(bad_rows)} 条合作视频 owner_mid 缺失/异常（仅影响这些视频被纳入KOL对齐，不影响其它KOL）。")
+            show_bad = bad_rows[["project","bvid","title","owner_name","owner_mid"]].copy()
+            st.dataframe(show_bad, use_container_width=True, height=220)
+        else:
+            st.success("未发现合作视频的 owner_mid 异常。")
 
     name_map = (valid_mid_df.groupby("owner_mid")["owner_name"]
                 .agg(lambda s: s.value_counts().index[0]).to_dict())
 
     if btn_fill_all:
-        # ✅ 只按 baseline 项目去重：同一个BV允许同时存在于合作项目和 __BASELINE__
         existed_baseline = set(df_db[df_db["project"] == BASELINE_PROJECT]["bvid"].astype(str).tolist())
-
-        rows_to_write = {}  # key=(project,bvid) -> row dict
+        rows_to_write = {}
         stat = {"list_fail": 0, "detail_ok": 0, "detail_fail": 0, "vlist_added": 0}
 
         for mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
