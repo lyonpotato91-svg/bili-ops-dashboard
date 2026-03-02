@@ -2,6 +2,8 @@ import re
 import time
 import io
 import sqlite3
+import hashlib
+import urllib.parse
 import requests
 import numpy as np
 import pandas as pd
@@ -291,6 +293,53 @@ def add_perf_cols(df_show: pd.DataFrame, df_all: pd.DataFrame, window_n: int, mi
     return df_show
 
 # =========================
+# ✅ WBI 签名（解决少部分UP抓不到vlist导致“基准不足”）
+# =========================
+_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32,
+    15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61,
+    26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63,
+    57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+def _get_mixin_key(img_key: str, sub_key: str) -> str:
+    s = img_key + sub_key
+    return "".join([s[i] for i in _MIXIN_KEY_ENC_TAB])[:32]
+
+@st.cache_data(ttl=60*30)  # 30分钟缓存一次
+def _get_wbi_keys() -> tuple[str, str]:
+    nav = "https://api.bilibili.com/x/web-interface/nav"
+    r = requests.get(nav, headers=HEADERS, timeout=10)
+    j = r.json()
+    wbi_img = (j.get("data") or {}).get("wbi_img") or {}
+    img_url = wbi_img.get("img_url", "")
+    sub_url = wbi_img.get("sub_url", "")
+    img_key = img_url.split("/")[-1].split(".")[0]
+    sub_key = sub_url.split("/")[-1].split(".")[0]
+    return img_key, sub_key
+
+def _wbi_sign(params: dict) -> dict:
+    img_key, sub_key = _get_wbi_keys()
+    mixin_key = _get_mixin_key(img_key, sub_key)
+
+    params = {k: v for k, v in params.items() if v is not None}
+    params["wts"] = int(time.time())
+
+    # 过滤特殊字符（官方口径）
+    def _filter(v):
+        return re.sub(r"[!'()*]", "", str(v))
+
+    sorted_items = sorted((k, _filter(v)) for k, v in params.items())
+    query = urllib.parse.urlencode(sorted_items)
+    w_rid = hashlib.md5((query + mixin_key).encode("utf-8")).hexdigest()
+    params["w_rid"] = w_rid
+    return params
+
+# =========================
 # B站抓取
 # =========================
 def fetch_video_detail_by_bvid(bvid: str) -> dict | None:
@@ -324,18 +373,29 @@ def fetch_video_detail_by_bvid(bvid: str) -> dict | None:
     return None
 
 def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
+    """
+    ✅ 改为WBI签名请求，提高成功率，解决“主页有视频但抓不到导致基准不足”
+    """
     api = "https://api.bilibili.com/x/space/arc/search"
     out = []
     ps = 50
     pn = 1
     while len(out) < n and pn <= 5:
-        r = requests.get(api, params={"mid": mid, "pn": pn, "ps": ps, "order": "pubdate"}, headers=HEADERS, timeout=10)
-        j = r.json()
+        params = {"mid": mid, "pn": pn, "ps": ps, "order": "pubdate"}
+        params = _wbi_sign(params)
+        try:
+            r = requests.get(api, params=params, headers=HEADERS, timeout=10)
+            j = r.json()
+        except Exception:
+            break
+
         if j.get("code") != 0:
             break
+
         vlist = (((j.get("data") or {}).get("list") or {}).get("vlist")) or []
         if not vlist:
             break
+
         for v in vlist:
             bvid = v.get("bvid")
             if not bvid:
@@ -350,6 +410,7 @@ def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
             if len(out) >= n:
                 break
         pn += 1
+
     return out[:n]
 
 # =========================
@@ -610,7 +671,7 @@ if len(proj_df) >= 2:
     st.plotly_chart(fig_q, use_container_width=True)
 
 # =========================
-# ✅ 跨项目解读（四象限下方，项目对比）
+# ✅ 跨项目解读（四象限下方：项目对比）
 # =========================
 st.subheader("跨项目解读（四象限下方：用于对比不同项目）")
 if proj_df.empty:
@@ -630,8 +691,8 @@ else:
     lines = []
     lines.append("1）整体结构：当前项目在四象限中呈现差异化分布，可采用不同内容打法与KPI重点。")
     lines.append(f"2）更强项目（互动&沉淀更靠前）：{strongest['project']}（互动率中位数 {strongest['er']*100:.2f}%，深度信号中位数 {strongest['deep']*100:.1f}%）。")
-    lines.append(f"3）更稳项目（波动更小）：{steadiest['project']}（互动率波动IQR {steadiest['iqr']*100:.2f}pp），适合稳定节奏与系列化。")
-    lines.append(f"4）结构风险提示：{risky['project']} Top1播放贡献 {risky['top1']*100:.1f}%（Top3 {risky['top3']*100:.1f}%），存在头部依赖倾向，建议补齐腰部内容密度降低单点波动。")
+    lines.append(f"3）更稳项目（波动更小）：{steadiest['project']}（互动率波动IQR {steadiest['iqr']*100:.2f}pp）。")
+    lines.append(f"4）结构风险提示：{risky['project']} Top1播放贡献 {risky['top1']*100:.1f}%（Top3 {risky['top3']*100:.1f}%），建议补齐腰部内容密度降低单点波动。")
     st.write("\n".join(lines))
 
 # =========================
@@ -681,10 +742,9 @@ fig = px.box(df_f, x="project", y="engagement_rate", points="all", hover_data=["
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ 周报结论（逐项目输出：只评判项目内，不混在一起）
+# ✅ 周报结论（逐项目输出：只评判项目内）
 # =========================
 st.subheader("周报结论（逐项目输出：只评判项目内）")
-
 projects_for_weekly = sel_projects if (sel_projects and len(sel_projects) > 0) else projects
 if not projects_for_weekly:
     st.info("暂无项目可输出周报结论。")
@@ -760,30 +820,25 @@ with cA:
 with cB:
     btn_build_kol = st.button("📚 生成KOL对比表（含标注）")
 with cC:
-    st.caption("标注：⭐合作明显更好 / ⚠️合作偏弱 / 空=正常区间。")
+    st.caption("本版关键：KOL基准抓取使用WBI签名，显著降低“主页有视频但抓不到”的概率。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
-
-    # 用原始owner_mid做一次质量检查（不被_norm_mid吞掉）
     raw_mid = collab_df["owner_mid"].copy()
     raw_mid_str = raw_mid.astype(str).fillna("").str.strip()
     bad_mask = raw_mid_str.eq("") | raw_mid_str.str.contains(r"\D", regex=True) | raw_mid_str.str.len().gt(12)
 
-    # 用规范化mid用于实际逻辑
     collab_df["owner_mid"] = collab_df["owner_mid"].apply(_norm_mid)
     valid_mid_df = collab_df[collab_df["owner_mid"].astype(str).str.len() > 0].copy()
+    invalid_mid_cnt = int((collab_df["owner_mid"].astype(str).str.len() == 0).sum())
 
     st.caption(f"合作UP主数：{collab_df['owner_mid'].nunique()}（含缺/异常mid）｜可抓取mid的UP数：{valid_mid_df['owner_mid'].nunique()}｜合作视频数：{len(collab_df)}")
 
-    # ✅ 默认不提示；需要时才展开，并列出具体是哪几条
     if show_kol_quality_hint:
-        bad_rows = df_db[df_db.index.isin(collab_df.index)].copy()
-        bad_rows = bad_rows[bad_mask.values].copy()
+        bad_rows = collab_df[bad_mask.values].copy()
         if not bad_rows.empty:
-            st.warning(f"发现 {len(bad_rows)} 条合作视频 owner_mid 缺失/异常（仅影响这些视频被纳入KOL对齐，不影响其它KOL）。")
-            show_bad = bad_rows[["project","bvid","title","owner_name","owner_mid"]].copy()
-            st.dataframe(show_bad, use_container_width=True, height=220)
+            st.warning(f"发现 {len(bad_rows)} 条合作视频 owner_mid 缺失/异常（仅影响这些视频被纳入KOL对齐）。")
+            st.dataframe(bad_rows[["project","bvid","title","owner_name","owner_mid"]], use_container_width=True, height=220)
         else:
             st.success("未发现合作视频的 owner_mid 异常。")
 
@@ -793,16 +848,19 @@ if collab_projects:
     if btn_fill_all:
         existed_baseline = set(df_db[df_db["project"] == BASELINE_PROJECT]["bvid"].astype(str).tolist())
         rows_to_write = {}
-        stat = {"list_fail": 0, "detail_ok": 0, "detail_fail": 0, "vlist_added": 0}
+        stat = {"list_fail": 0, "list_empty": 0, "detail_ok": 0, "detail_fail": 0, "vlist_added": 0}
 
         for mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
+            disp = name_map.get(mid, "")
             try:
                 vlist = fetch_vlist_by_mid(int(mid), n=int(fetch_n))
             except Exception:
                 stat["list_fail"] += 1
                 continue
 
-            disp = name_map.get(mid, "")
+            if not vlist:
+                stat["list_empty"] += 1
+                continue
 
             for v in vlist:
                 bvid = v["bvid"]
@@ -849,7 +907,11 @@ if collab_projects:
             df_new["pubdate"] = pd.to_datetime(df_new["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             df_new["fetched_at"] = pd.to_datetime(df_new["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             upsert_rows(df_new)
-            st.success(f"补齐完成：新增 {stat['vlist_added']} 条基准；详情补全成功 {stat['detail_ok']}，失败 {stat['detail_fail']}；列表失败 {stat['list_fail']}")
+            st.success(
+                f"补齐完成：新增 {stat['vlist_added']} 条基准；"
+                f"列表失败 {stat['list_fail']}，列表空 {stat['list_empty']}；"
+                f"详情补全成功 {stat['detail_ok']}，失败 {stat['detail_fail']}"
+            )
             st.rerun()
         else:
             st.warning("本次未新增：可能已补齐、或接口波动导致vlist为空。")
@@ -945,20 +1007,6 @@ if collab_projects:
             st.warning("没有生成KOL结果：请先补齐基准，或降低最低样本数。")
         else:
             lib = pd.DataFrame(rows)
-
-            def _pct_to_float(x):
-                try:
-                    if x == "-" or pd.isna(x):
-                        return -999
-                    return float(str(x).replace("%",""))
-                except Exception:
-                    return -999
-
-            lib["_flag"] = lib["标注"].apply(lambda s: 2 if str(s).startswith("⭐") else (1 if str(s).startswith("⚠️") else 0))
-            lib["_view"] = lib["播放提升"].map(_pct_to_float)
-            lib["_er"] = lib["互动率提升"].map(_pct_to_float)
-            lib = lib.sort_values(["_flag","_view","_er"], ascending=[False, False, False]).drop(columns=["_flag","_view","_er"])
-
             st.dataframe(lib, use_container_width=True, height=520)
             st.download_button(
                 "⬇️ 下载KOL对比表（CSV）",
