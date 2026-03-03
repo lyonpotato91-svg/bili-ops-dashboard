@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import io
@@ -16,7 +17,11 @@ st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
 # Constants
 # =========================
 BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不出现在项目归档/筛选里
-DB_PATH = "bili_dashboard.db"           # SQLite文件（持久化）
+
+# ✅ 关键修复：把DB固定到 app.py 同目录，避免工作目录变化导致“新建空库→基准全没”
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(APP_DIR, "bili_dashboard.db")  # SQLite文件（持久化）
+
 TABLE_NAME = "videos"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
