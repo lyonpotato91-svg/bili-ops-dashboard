@@ -18,9 +18,9 @@ st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
 # =========================
 BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不出现在项目归档/筛选里
 
-# ✅ 关键修复：把DB固定到 app.py 同目录，避免工作目录变化导致“新建空库→基准全没”
+# ✅ 修复1：DB固定到 app.py 同目录（避免工作目录变化导致“新建空库→基准全没”）
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(APP_DIR, "bili_dashboard.db")  # SQLite文件（持久化）
+DB_PATH = os.path.join(APP_DIR, "bili_dashboard.db")
 
 TABLE_NAME = "videos"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -253,7 +253,7 @@ def _sort_owner_hist(df_owner: pd.DataFrame) -> pd.DataFrame:
     return g
 
 # =========================
-# Performance labels (用于Top/Bottom和表格的“发挥”标签)
+# Performance labels
 # =========================
 def perf_label(value: float, baseline_values: np.ndarray, ratio_hi: float, ratio_lo: float, min_n: int) -> str:
     baseline_values = baseline_values[~np.isnan(baseline_values)]
@@ -298,7 +298,7 @@ def add_perf_cols(df_show: pd.DataFrame, df_all: pd.DataFrame, window_n: int, mi
     return df_show
 
 # =========================
-# ✅ WBI 签名（解决少部分UP抓不到vlist导致“基准不足”）
+# ✅ WBI 签名
 # =========================
 _MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32,
@@ -315,7 +315,7 @@ def _get_mixin_key(img_key: str, sub_key: str) -> str:
     s = img_key + sub_key
     return "".join([s[i] for i in _MIXIN_KEY_ENC_TAB])[:32]
 
-@st.cache_data(ttl=60*30)  # 30分钟缓存一次
+@st.cache_data(ttl=60*30)
 def _get_wbi_keys() -> tuple[str, str]:
     nav = "https://api.bilibili.com/x/web-interface/nav"
     r = requests.get(nav, headers=HEADERS, timeout=10)
@@ -330,11 +330,9 @@ def _get_wbi_keys() -> tuple[str, str]:
 def _wbi_sign(params: dict) -> dict:
     img_key, sub_key = _get_wbi_keys()
     mixin_key = _get_mixin_key(img_key, sub_key)
-
     params = {k: v for k, v in params.items() if v is not None}
     params["wts"] = int(time.time())
 
-    # 过滤特殊字符（官方口径）
     def _filter(v):
         return re.sub(r"[!'()*]", "", str(v))
 
@@ -379,26 +377,37 @@ def fetch_video_detail_by_bvid(bvid: str) -> dict | None:
 
 def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
     """
-    ✅ 改为WBI签名请求，提高成功率，解决“主页有视频但抓不到导致基准不足”
+    ✅ 修复2：WBI签名要配套使用 /x/space/wbi/arc/search
+    否则经常出现：返回code!=0或vlist为空 → 你看到“基准不足”永远补不起来
     """
-    api = "https://api.bilibili.com/x/space/arc/search"
+    api_wbi = "https://api.bilibili.com/x/space/wbi/arc/search"   # ✅ 正确的WBI端点
+    api_old = "https://api.bilibili.com/x/space/arc/search"       # 兜底（有时也能用）
+
     out = []
     ps = 50
     pn = 1
-    while len(out) < n and pn <= 5:
+
+    def _call(api_url: str) -> tuple[int, list]:
         params = {"mid": mid, "pn": pn, "ps": ps, "order": "pubdate"}
-        params = _wbi_sign(params)
-        try:
-            r = requests.get(api, params=params, headers=HEADERS, timeout=10)
-            j = r.json()
-        except Exception:
-            break
-
-        if j.get("code") != 0:
-            break
-
+        if "wbi" in api_url:
+            params = _wbi_sign(params)
+        r = requests.get(api_url, params=params, headers=HEADERS, timeout=10)
+        j = r.json()
+        code = j.get("code", -1)
         vlist = (((j.get("data") or {}).get("list") or {}).get("vlist")) or []
-        if not vlist:
+        return code, vlist
+
+    while len(out) < n and pn <= 5:
+        try:
+            code, vlist = _call(api_wbi)
+            if code != 0 or not vlist:
+                # 兜底再试一次老接口（少部分情况下能救回来）
+                code2, vlist2 = _call(api_old)
+                if code2 == 0 and vlist2:
+                    vlist = vlist2
+                else:
+                    break
+        except Exception:
             break
 
         for v in vlist:
@@ -414,6 +423,7 @@ def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
             })
             if len(out) >= n:
                 break
+
         pn += 1
 
     return out[:n]
@@ -592,7 +602,7 @@ df_main = df_db[df_db["project"] != BASELINE_PROJECT].copy()
 df_f = df_main[df_main["project"].isin(sel_projects)].copy() if sel_projects else df_main.copy()
 
 # =========================
-# Add performance labels (用于表格/TopBottom)
+# Add performance labels
 # =========================
 df_f = add_perf_cols(df_f, df_db, baseline_window_n, baseline_min_n)
 
@@ -676,7 +686,7 @@ if len(proj_df) >= 2:
     st.plotly_chart(fig_q, use_container_width=True)
 
 # =========================
-# ✅ 跨项目解读（四象限下方：项目对比）
+# ✅ 跨项目解读
 # =========================
 st.subheader("跨项目解读（四象限下方：用于对比不同项目）")
 if proj_df.empty:
@@ -747,7 +757,7 @@ fig = px.box(df_f, x="project", y="engagement_rate", points="all", hover_data=["
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ 周报结论（逐项目输出：只评判项目内）
+# ✅ 周报结论（逐项目输出）
 # =========================
 st.subheader("周报结论（逐项目输出：只评判项目内）")
 projects_for_weekly = sel_projects if (sel_projects and len(sel_projects) > 0) else projects
