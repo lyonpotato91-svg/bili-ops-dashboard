@@ -18,7 +18,7 @@ st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
 # =========================
 BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不出现在项目归档/筛选里
 
-# ✅ 修复1：DB固定到 app.py 同目录（避免工作目录变化导致“新建空库→基准全没”）
+# ✅ DB固定到 app.py 同目录（避免工作目录变化导致“新建空库→基准全没”）
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "bili_dashboard.db")
 
@@ -253,7 +253,7 @@ def _sort_owner_hist(df_owner: pd.DataFrame) -> pd.DataFrame:
     return g
 
 # =========================
-# Performance labels
+# Performance labels (用于Top/Bottom和表格的“发挥”标签)
 # =========================
 def perf_label(value: float, baseline_values: np.ndarray, ratio_hi: float, ratio_lo: float, min_n: int) -> str:
     baseline_values = baseline_values[~np.isnan(baseline_values)]
@@ -298,7 +298,7 @@ def add_perf_cols(df_show: pd.DataFrame, df_all: pd.DataFrame, window_n: int, mi
     return df_show
 
 # =========================
-# ✅ WBI 签名
+# ✅ WBI 签名（解决少部分UP抓不到vlist导致“基准不足”）
 # =========================
 _MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32,
@@ -315,7 +315,7 @@ def _get_mixin_key(img_key: str, sub_key: str) -> str:
     s = img_key + sub_key
     return "".join([s[i] for i in _MIXIN_KEY_ENC_TAB])[:32]
 
-@st.cache_data(ttl=60*30)
+@st.cache_data(ttl=60*30)  # 30分钟缓存一次
 def _get_wbi_keys() -> tuple[str, str]:
     nav = "https://api.bilibili.com/x/web-interface/nav"
     r = requests.get(nav, headers=HEADERS, timeout=10)
@@ -330,6 +330,7 @@ def _get_wbi_keys() -> tuple[str, str]:
 def _wbi_sign(params: dict) -> dict:
     img_key, sub_key = _get_wbi_keys()
     mixin_key = _get_mixin_key(img_key, sub_key)
+
     params = {k: v for k, v in params.items() if v is not None}
     params["wts"] = int(time.time())
 
@@ -377,18 +378,18 @@ def fetch_video_detail_by_bvid(bvid: str) -> dict | None:
 
 def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
     """
-    ✅ 修复2：WBI签名要配套使用 /x/space/wbi/arc/search
-    否则经常出现：返回code!=0或vlist为空 → 你看到“基准不足”永远补不起来
+    ✅ WBI签名要配套 /x/space/wbi/arc/search
+    兜底再试一次老接口（少数情况下可用）
     """
-    api_wbi = "https://api.bilibili.com/x/space/wbi/arc/search"   # ✅ 正确的WBI端点
-    api_old = "https://api.bilibili.com/x/space/arc/search"       # 兜底（有时也能用）
+    api_wbi = "https://api.bilibili.com/x/space/wbi/arc/search"
+    api_old = "https://api.bilibili.com/x/space/arc/search"
 
     out = []
     ps = 50
     pn = 1
 
-    def _call(api_url: str) -> tuple[int, list]:
-        params = {"mid": mid, "pn": pn, "ps": ps, "order": "pubdate"}
+    def _call(api_url: str, pn_: int) -> tuple[int, list]:
+        params = {"mid": mid, "pn": pn_, "ps": ps, "order": "pubdate"}
         if "wbi" in api_url:
             params = _wbi_sign(params)
         r = requests.get(api_url, params=params, headers=HEADERS, timeout=10)
@@ -399,10 +400,9 @@ def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
 
     while len(out) < n and pn <= 5:
         try:
-            code, vlist = _call(api_wbi)
+            code, vlist = _call(api_wbi, pn)
             if code != 0 or not vlist:
-                # 兜底再试一次老接口（少部分情况下能救回来）
-                code2, vlist2 = _call(api_old)
+                code2, vlist2 = _call(api_old, pn)
                 if code2 == 0 and vlist2:
                     vlist = vlist2
                 else:
@@ -423,7 +423,6 @@ def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
             })
             if len(out) >= n:
                 break
-
         pn += 1
 
     return out[:n]
@@ -450,6 +449,7 @@ def kol_flag(view_lift: float | None, er_lift: float | None, deep_lift: float | 
 # Sidebar - global settings
 # =========================
 st.sidebar.title("📊 B站运营Dashboard")
+st.sidebar.caption(f"DB: {DB_PATH}")
 
 st.sidebar.markdown("#### 全局“发挥评价”口径（按KOL自身历史，不按时间）")
 baseline_window_n = st.sidebar.slider("基准：取该KOL最近N条视频（按发布时间/抓取时间排序）", 10, 60, 20, step=5)
@@ -602,7 +602,7 @@ df_main = df_db[df_db["project"] != BASELINE_PROJECT].copy()
 df_f = df_main[df_main["project"].isin(sel_projects)].copy() if sel_projects else df_main.copy()
 
 # =========================
-# Add performance labels
+# Add performance labels (用于表格/TopBottom)
 # =========================
 df_f = add_perf_cols(df_f, df_db, baseline_window_n, baseline_min_n)
 
@@ -686,7 +686,7 @@ if len(proj_df) >= 2:
     st.plotly_chart(fig_q, use_container_width=True)
 
 # =========================
-# ✅ 跨项目解读
+# ✅ 跨项目解读（四象限下方：项目对比）
 # =========================
 st.subheader("跨项目解读（四象限下方：用于对比不同项目）")
 if proj_df.empty:
@@ -757,7 +757,7 @@ fig = px.box(df_f, x="project", y="engagement_rate", points="all", hover_data=["
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ 周报结论（逐项目输出）
+# ✅ 周报结论（逐项目输出：只评判项目内）
 # =========================
 st.subheader("周报结论（逐项目输出：只评判项目内）")
 projects_for_weekly = sel_projects if (sel_projects and len(sel_projects) > 0) else projects
@@ -863,8 +863,12 @@ if collab_projects:
     if btn_fill_all:
         existed_baseline = set(df_db[df_db["project"] == BASELINE_PROJECT]["bvid"].astype(str).tolist())
         rows_to_write = {}
-        stat = {"list_fail": 0, "list_empty": 0, "detail_ok": 0, "detail_fail": 0, "vlist_added": 0}
+        stat = {
+            "list_fail": 0, "list_empty": 0, "detail_ok": 0, "detail_fail": 0, "vlist_added": 0,
+            "collab_refresh_total": 0, "collab_refresh_ok": 0, "collab_refresh_fail": 0
+        }
 
+        # ========= A) 补齐 baseline（原逻辑保持不变） =========
         for mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
             disp = name_map.get(mid, "")
             try:
@@ -917,19 +921,59 @@ if collab_projects:
 
                 time.sleep(float(sleep_sec))
 
+        # ========= B) 新增：同时刷新“已入库的合作BV”数据（无需手动再填BV） =========
+        # 刷新范围：合作项目内、owner_mid在本次合作KOL集合里的所有已收录BV
+        valid_mids = set(valid_mid_df["owner_mid"].astype(str).tolist())
+        collab_in_db = df_db[(df_db["project"].isin(collab_projects)) & (df_db["project"] != BASELINE_PROJECT)].copy()
+        collab_in_db["owner_mid"] = collab_in_db["owner_mid"].apply(_norm_mid)
+        collab_in_db = collab_in_db[collab_in_db["owner_mid"].isin(valid_mids)]
+        collab_pairs = (collab_in_db[["project","bvid","url"]]
+                        .dropna(subset=["project","bvid"])
+                        .drop_duplicates()
+                        .values
+                        .tolist())
+
+        stat["collab_refresh_total"] = len(collab_pairs)
+
+        for proj, bvid, url in collab_pairs:
+            bvid = str(bvid)
+            if not bvid.startswith("BV"):
+                continue
+
+            detail = fetch_video_detail_by_bvid(bvid)
+            if detail is None:
+                stat["collab_refresh_fail"] += 1
+                time.sleep(float(sleep_sec))
+                continue
+
+            # 用详情覆盖关键指标，但保持“project=原合作项目”
+            detail["project"] = str(proj)
+            detail["url"] = _safe_str(url) if _safe_str(url) else f"https://www.bilibili.com/video/{bvid}"
+            detail["data_type"] = "collab"
+            detail["baseline_for"] = ""
+            detail["fans_delta"] = 0
+            detail["fetched_at"] = pd.Timestamp.now()
+            rows_to_write[(detail["project"], bvid)] = detail
+            stat["collab_refresh_ok"] += 1
+
+            time.sleep(float(sleep_sec))
+
+        # ========= C) 写入数据库 =========
         if rows_to_write:
             df_new = normalize_df(pd.DataFrame(list(rows_to_write.values())))
             df_new["pubdate"] = pd.to_datetime(df_new["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             df_new["fetched_at"] = pd.to_datetime(df_new["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             upsert_rows(df_new)
+
             st.success(
                 f"补齐完成：新增 {stat['vlist_added']} 条基准；"
                 f"列表失败 {stat['list_fail']}，列表空 {stat['list_empty']}；"
-                f"详情补全成功 {stat['detail_ok']}，失败 {stat['detail_fail']}"
+                f"详情补全成功 {stat['detail_ok']}，失败 {stat['detail_fail']}；"
+                f"合作BV刷新：{stat['collab_refresh_ok']}/{stat['collab_refresh_total']} 成功（失败 {stat['collab_refresh_fail']}）"
             )
             st.rerun()
         else:
-            st.warning("本次未新增：可能已补齐、或接口波动导致vlist为空。")
+            st.warning("本次未写入任何数据：可能接口波动导致vlist为空，且合作BV刷新也未成功。")
 
     st.markdown("**KOL基准诊断（按owner_mid统计库内数量）**")
     diag = []
