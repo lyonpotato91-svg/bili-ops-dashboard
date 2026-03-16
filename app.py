@@ -22,6 +22,10 @@ BASELINE_PROJECT = "__BASELINE__"       # 隐藏项目：不出现在项目归�
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "bili_dashboard.db")
 
+# ✅ 自动备份（尽可能减少“每周打开空库”）
+BACKUP_DIR = os.path.join(APP_DIR, "backup")
+BACKUP_LATEST_CSV = os.path.join(BACKUP_DIR, "backup_latest.csv")
+
 TABLE_NAME = "videos"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -58,12 +62,79 @@ def init_db():
         """)
         conn.commit()
 
+def _ensure_backup_dir():
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+def _save_backup_csv(df_all: pd.DataFrame):
+    """
+    将全量库写到 backup_latest.csv
+    """
+    if df_all is None or df_all.empty:
+        return
+    _ensure_backup_dir()
+    try:
+        df_all.to_csv(BACKUP_LATEST_CSV, index=False, encoding="utf-8-sig")
+    except Exception:
+        # 备份失败不要影响主流程
+        pass
+
+def _try_restore_from_backup() -> bool:
+    """
+    如果DB为空，尝试从 backup_latest.csv 恢复到DB
+    返回是否恢复成功
+    """
+    if not os.path.exists(BACKUP_LATEST_CSV):
+        return False
+    try:
+        raw = open(BACKUP_LATEST_CSV, "rb").read()
+    except Exception:
+        return False
+
+    df_imp = None
+    for enc in ["utf-8-sig", "utf-8", "gbk"]:
+        try:
+            df_imp = pd.read_csv(io.BytesIO(raw), encoding=enc)
+            break
+        except Exception:
+            df_imp = None
+
+    if df_imp is None or df_imp.empty:
+        return False
+
+    df_imp = normalize_df(df_imp)
+    if "fetched_at" not in df_imp.columns:
+        df_imp["fetched_at"] = pd.Timestamp.now()
+
+    df_imp["pubdate"] = pd.to_datetime(df_imp["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    df_imp["fetched_at"] = pd.to_datetime(df_imp["fetched_at"], errors="coerce").fillna(pd.Timestamp.now()).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    upsert_rows(df_imp, skip_backup=True)
+    return True
+
 def load_all_rows() -> pd.DataFrame:
+    """
+    读取DB；如果为空，自动尝试从 backup_latest.csv 恢复一次再读
+    """
     init_db()
     with db_conn() as conn:
-        return pd.read_sql_query(f"SELECT * FROM {TABLE_NAME}", conn)
+        df = pd.read_sql_query(f"SELECT * FROM {TABLE_NAME}", conn)
 
-def upsert_rows(df_new: pd.DataFrame):
+    if df is not None and not df.empty:
+        return df
+
+    # DB为空 -> 尝试恢复
+    restored = _try_restore_from_backup()
+    if restored:
+        with db_conn() as conn:
+            df2 = pd.read_sql_query(f"SELECT * FROM {TABLE_NAME}", conn)
+        return df2
+
+    return df
+
+def upsert_rows(df_new: pd.DataFrame, skip_backup: bool = False):
     if df_new is None or df_new.empty:
         return
     init_db()
@@ -89,11 +160,20 @@ def upsert_rows(df_new: pd.DataFrame):
         conn.executemany(sql, records)
         conn.commit()
 
+    # ✅ 每次写入后自动备份（尽可能防止“打开空库”）
+    if not skip_backup:
+        try:
+            df_all = load_all_rows()
+            _save_backup_csv(df_all)
+        except Exception:
+            pass
+
 def clear_all_data():
     init_db()
     with db_conn() as conn:
         conn.execute(f"DELETE FROM {TABLE_NAME}")
         conn.commit()
+    # 不删除备份：避免误点“清空”后无处恢复
 
 # =========================
 # Utils
@@ -298,7 +378,7 @@ def add_perf_cols(df_show: pd.DataFrame, df_all: pd.DataFrame, window_n: int, mi
     return df_show
 
 # =========================
-# ✅ WBI 签名（解决少部分UP抓不到vlist导致“基准不足”）
+# ✅ WBI 签名
 # =========================
 _MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32,
@@ -315,7 +395,7 @@ def _get_mixin_key(img_key: str, sub_key: str) -> str:
     s = img_key + sub_key
     return "".join([s[i] for i in _MIXIN_KEY_ENC_TAB])[:32]
 
-@st.cache_data(ttl=60*30)  # 30分钟缓存一次
+@st.cache_data(ttl=60*30)
 def _get_wbi_keys() -> tuple[str, str]:
     nav = "https://api.bilibili.com/x/web-interface/nav"
     r = requests.get(nav, headers=HEADERS, timeout=10)
@@ -449,7 +529,15 @@ def kol_flag(view_lift: float | None, er_lift: float | None, deep_lift: float | 
 # Sidebar - global settings
 # =========================
 st.sidebar.title("📊 B站运营Dashboard")
-st.sidebar.caption(f"DB: {DB_PATH}")
+# ✅ 展示当前DB、备份位置 & 当前记录数（方便判断是不是“环境重置”）
+try:
+    _tmp = load_all_rows()
+    st.sidebar.caption(f"DB: {DB_PATH}")
+    st.sidebar.caption(f"Backup: {BACKUP_LATEST_CSV}")
+    st.sidebar.caption(f"Rows: {0 if _tmp is None else len(_tmp)}")
+except Exception:
+    st.sidebar.caption(f"DB: {DB_PATH}")
+    st.sidebar.caption(f"Backup: {BACKUP_LATEST_CSV}")
 
 st.sidebar.markdown("#### 全局“发挥评价”口径（按KOL自身历史，不按时间）")
 baseline_window_n = st.sidebar.slider("基准：取该KOL最近N条视频（按发布时间/抓取时间排序）", 10, 60, 20, step=5)
@@ -493,7 +581,7 @@ with st.sidebar.expander("备份/恢复", expanded=False):
 with st.sidebar.expander("危险操作：清空全部数据", expanded=False):
     if st.button("🗑️ 清空数据库（不可撤销）"):
         clear_all_data()
-        st.success("已清空。")
+        st.success("已清空（备份文件未删除，如需可从备份恢复）。")
         st.rerun()
 
 st.sidebar.divider()
@@ -537,7 +625,7 @@ if mode == "粘贴链接/BV采集":
             df_new["fetched_at"] = pd.to_datetime(df_new["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             upsert_rows(df_new)
 
-        st.sidebar.success(f"成功采集 {ok} 条，失败 {fail} 条（已保存）")
+        st.sidebar.success(f"成功采集 {ok} 条，失败 {fail} 条（已保存+自动备份）")
         st.rerun()
 
 else:
@@ -575,7 +663,7 @@ else:
                 df_csv["fetched_at"] = pd.to_datetime(df_csv["fetched_at"], errors="coerce").fillna(pd.Timestamp.now()).dt.strftime("%Y-%m-%d %H:%M:%S")
                 upsert_rows(df_csv)
 
-                st.sidebar.success(f"导入成功：{len(df_csv):,} 行（已保存）")
+                st.sidebar.success(f"导入成功：{len(df_csv):,} 行（已保存+自动备份）")
                 st.rerun()
 
 # =========================
@@ -586,7 +674,7 @@ df_db = normalize_df(df_db) if not df_db.empty else df_db
 
 st.title("B站日常运营数据 Dashboard")
 if df_db.empty:
-    st.info("数据库为空：请在左侧采集或导入。")
+    st.info("数据库为空：请在左侧采集或导入。（若你认为数据不应为空：说明部署环境可能重置了磁盘；本应用会优先尝试从 backup/backup_latest.csv 自动恢复）")
     st.stop()
 
 df_db = compute_metrics(df_db)
@@ -602,7 +690,7 @@ df_main = df_db[df_db["project"] != BASELINE_PROJECT].copy()
 df_f = df_main[df_main["project"].isin(sel_projects)].copy() if sel_projects else df_main.copy()
 
 # =========================
-# Add performance labels (用于表格/TopBottom)
+# Add performance labels
 # =========================
 df_f = add_perf_cols(df_f, df_db, baseline_window_n, baseline_min_n)
 
@@ -868,7 +956,7 @@ if collab_projects:
             "collab_refresh_total": 0, "collab_refresh_ok": 0, "collab_refresh_fail": 0
         }
 
-        # ========= A) 补齐 baseline（原逻辑保持不变） =========
+        # ========= A) 补齐 baseline =========
         for mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
             disp = name_map.get(mid, "")
             try:
@@ -921,8 +1009,7 @@ if collab_projects:
 
                 time.sleep(float(sleep_sec))
 
-        # ========= B) 新增：同时刷新“已入库的合作BV”数据（无需手动再填BV） =========
-        # 刷新范围：合作项目内、owner_mid在本次合作KOL集合里的所有已收录BV
+        # ========= B) 刷新已入库合作BV =========
         valid_mids = set(valid_mid_df["owner_mid"].astype(str).tolist())
         collab_in_db = df_db[(df_db["project"].isin(collab_projects)) & (df_db["project"] != BASELINE_PROJECT)].copy()
         collab_in_db["owner_mid"] = collab_in_db["owner_mid"].apply(_norm_mid)
@@ -932,7 +1019,6 @@ if collab_projects:
                         .drop_duplicates()
                         .values
                         .tolist())
-
         stat["collab_refresh_total"] = len(collab_pairs)
 
         for proj, bvid, url in collab_pairs:
@@ -946,7 +1032,6 @@ if collab_projects:
                 time.sleep(float(sleep_sec))
                 continue
 
-            # 用详情覆盖关键指标，但保持“project=原合作项目”
             detail["project"] = str(proj)
             detail["url"] = _safe_str(url) if _safe_str(url) else f"https://www.bilibili.com/video/{bvid}"
             detail["data_type"] = "collab"
@@ -955,7 +1040,6 @@ if collab_projects:
             detail["fetched_at"] = pd.Timestamp.now()
             rows_to_write[(detail["project"], bvid)] = detail
             stat["collab_refresh_ok"] += 1
-
             time.sleep(float(sleep_sec))
 
         # ========= C) 写入数据库 =========
@@ -969,7 +1053,8 @@ if collab_projects:
                 f"补齐完成：新增 {stat['vlist_added']} 条基准；"
                 f"列表失败 {stat['list_fail']}，列表空 {stat['list_empty']}；"
                 f"详情补全成功 {stat['detail_ok']}，失败 {stat['detail_fail']}；"
-                f"合作BV刷新：{stat['collab_refresh_ok']}/{stat['collab_refresh_total']} 成功（失败 {stat['collab_refresh_fail']}）"
+                f"合作BV刷新：{stat['collab_refresh_ok']}/{stat['collab_refresh_total']} 成功（失败 {stat['collab_refresh_fail']}）。"
+                f"（数据已自动备份到 backup/backup_latest.csv）"
             )
             st.rerun()
         else:
