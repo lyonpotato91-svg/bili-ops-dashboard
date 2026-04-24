@@ -5,6 +5,8 @@ import io
 import sqlite3
 import hashlib
 import urllib.parse
+import json
+import random
 import requests
 import numpy as np
 import pandas as pd
@@ -27,7 +29,13 @@ BACKUP_DIR = os.path.join(APP_DIR, "backup")
 BACKUP_LATEST_CSV = os.path.join(BACKUP_DIR, "backup_latest.csv")
 
 TABLE_NAME = "videos"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Origin": "https://space.bilibili.com",
+    "Referer": "https://space.bilibili.com/",
+}
 
 # =========================
 # DB
@@ -426,14 +434,150 @@ def _wbi_sign(params: dict) -> dict:
 # =========================
 # B站抓取
 # =========================
+def _sleep_jitter(base: float = 0.6):
+    """轻微随机等待，降低连续请求特征。"""
+    try:
+        base = float(base)
+    except Exception:
+        base = 0.6
+    time.sleep(max(0.1, base) + random.uniform(0.05, 0.35))
+
+
+def _make_bili_session(referer: str = "https://www.bilibili.com/") -> requests.Session:
+    """
+    为每次抓取建立带常见浏览器头与基础cookie的 Session。
+    目标不是绕过风控，而是让请求上下文更接近真实浏览器访问，减少接口偶发空列表。
+    """
+    sess = requests.Session()
+    h = HEADERS.copy()
+    h.update({
+        "Referer": referer,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    })
+    sess.headers.update(h)
+    try:
+        sess.get("https://www.bilibili.com/", timeout=8)
+    except Exception:
+        pass
+    return sess
+
+
+def _as_video_row(v: dict) -> dict | None:
+    """兼容 B站不同接口/页面里常见的视频字段。"""
+    if not isinstance(v, dict):
+        return None
+    bvid = v.get("bvid") or v.get("bvidStr") or v.get("BV")
+    if not bvid:
+        uri = _safe_str(v.get("uri") or v.get("arcurl") or v.get("url") or "")
+        bvid = parse_bvid(uri)
+    if not bvid:
+        return None
+
+    created = v.get("created") or v.get("pubdate") or v.get("ctime")
+    if created is not None and _safe_int(created) < 1000000000:
+        created = None
+
+    stat = v.get("stat") or {}
+    return {
+        "bvid": bvid,
+        "title": v.get("title", ""),
+        "pubdate": pd.to_datetime(created or 0, unit="s", errors="coerce"),
+        "view": _safe_int(v.get("play", stat.get("view", v.get("view", 0)))),
+        "reply": _safe_int(v.get("comment", stat.get("reply", v.get("reply", 0)))),
+    }
+
+
+def _dedupe_rows(rows: list[dict], n: int) -> list[dict]:
+    seen, out = set(), []
+    for r in rows:
+        bvid = r.get("bvid") if isinstance(r, dict) else None
+        if not bvid or bvid in seen:
+            continue
+        seen.add(bvid)
+        out.append(r)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _extract_video_rows_from_html(html: str, n: int = 30) -> list[dict]:
+    """从UP空间页源码里兜底提取 BV 号，再用详情接口补数据。"""
+    if not html:
+        return []
+
+    bvids = []
+    for bv in re.findall(r"BV[0-9A-Za-z]{10}", html):
+        if bv not in bvids:
+            bvids.append(bv)
+        if len(bvids) >= n:
+            break
+
+    rows = []
+    for bvid in bvids[:n]:
+        detail = fetch_video_detail_by_bvid(bvid)
+        if detail is not None:
+            rows.append({
+                "bvid": bvid,
+                "title": detail.get("title", ""),
+                "pubdate": detail.get("pubdate", pd.NaT),
+                "view": _safe_int(detail.get("view", 0)),
+                "reply": _safe_int(detail.get("reply", 0)),
+            })
+        else:
+            rows.append({"bvid": bvid, "title": "", "pubdate": pd.NaT, "view": 0, "reply": 0})
+        _sleep_jitter(0.25)
+    return rows
+
+
+def _open_space_with_headless_browser(mid: int, wait_sec: float = 4.0) -> tuple[str, dict]:
+    """
+    可选兜底：如果本机/部署环境装了 selenium + chrome，就无头打开UP主页。
+    没有依赖时静默返回空，不影响原有功能。
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+    except Exception:
+        return "", {}
+
+    driver = None
+    try:
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1366,900")
+        options.add_argument(f"--user-agent={HEADERS['User-Agent']}")
+        driver = webdriver.Chrome(options=options)
+        url = f"https://space.bilibili.com/{mid}/video"
+        driver.get(url)
+        time.sleep(max(2.5, float(wait_sec)))
+        html = driver.page_source or ""
+        cookies = {c.get("name"): c.get("value") for c in driver.get_cookies() if c.get("name")}
+        return html, cookies
+    except Exception:
+        return "", {}
+    finally:
+        try:
+            if driver is not None:
+                driver.quit()
+        except Exception:
+            pass
+
+
 def fetch_video_detail_by_bvid(bvid: str) -> dict | None:
     api = "https://api.bilibili.com/x/web-interface/view"
+    sess = _make_bili_session(referer=f"https://www.bilibili.com/video/{bvid}")
     for _ in range(3):
         try:
-            r = requests.get(api, params={"bvid": bvid}, headers=HEADERS, timeout=10)
+            r = sess.get(api, params={"bvid": bvid}, timeout=10)
             j = r.json()
             if j.get("code") != 0:
-                time.sleep(0.6)
+                _sleep_jitter(0.6)
                 continue
             d = j["data"]
             stat = d.get("stat", {})
@@ -453,57 +597,98 @@ def fetch_video_detail_by_bvid(bvid: str) -> dict | None:
                 "share": stat.get("share", 0),
             }
         except Exception:
-            time.sleep(0.6)
+            _sleep_jitter(0.6)
     return None
 
-def fetch_vlist_by_mid(mid: int, n: int = 30) -> list[dict]:
+
+def fetch_vlist_by_mid(mid: int, n: int = 30, use_browser_fallback: bool = True, sleep_sec: float = 0.8) -> list[dict]:
     """
-    ✅ WBI签名要配套 /x/space/wbi/arc/search
-    兜底再试一次老接口（少数情况下可用）
+    KOL近期公开视频列表抓取优化版：
+    1）先访问UP个人主页，建立更像真实浏览器的 Session/Cookie；
+    2）优先使用 /x/space/wbi/arc/search；
+    3）失败后尝试老接口；
+    4）仍为空时，尝试从UP空间HTML提取BV；
+    5）可选：如果环境支持 selenium+Chrome，则无头打开UP主页再用浏览器cookie重试。
     """
     api_wbi = "https://api.bilibili.com/x/space/wbi/arc/search"
     api_old = "https://api.bilibili.com/x/space/arc/search"
+    space_url = f"https://space.bilibili.com/{mid}/video"
 
-    out = []
+    sess = _make_bili_session(referer=space_url)
+    try:
+        sess.get(space_url, timeout=10)
+    except Exception:
+        pass
+
     ps = 50
-    pn = 1
 
-    def _call(api_url: str, pn_: int) -> tuple[int, list]:
-        params = {"mid": mid, "pn": pn_, "ps": ps, "order": "pubdate"}
+    def _call(api_url: str, pn_: int, session: requests.Session) -> tuple[int, list]:
+        params = {"mid": mid, "pn": pn_, "ps": ps, "order": "pubdate", "platform": "web", "web_location": "1550101"}
         if "wbi" in api_url:
             params = _wbi_sign(params)
-        r = requests.get(api_url, params=params, headers=HEADERS, timeout=10)
+        h = {"Referer": space_url}
+        r = session.get(api_url, params=params, headers=h, timeout=12)
         j = r.json()
         code = j.get("code", -1)
-        vlist = (((j.get("data") or {}).get("list") or {}).get("vlist")) or []
+        data = j.get("data") or {}
+        vlist = ((data.get("list") or {}).get("vlist")) or []
         return code, vlist
 
-    while len(out) < n and pn <= 5:
-        try:
-            code, vlist = _call(api_wbi, pn)
-            if code != 0 or not vlist:
-                code2, vlist2 = _call(api_old, pn)
-                if code2 == 0 and vlist2:
-                    vlist = vlist2
-                else:
-                    break
-        except Exception:
-            break
+    def _api_loop(session: requests.Session) -> list[dict]:
+        rows = []
+        pn = 1
+        while len(rows) < n and pn <= 6:
+            vlist = []
+            try:
+                code, vlist = _call(api_wbi, pn, session)
+                if code != 0 or not vlist:
+                    code2, vlist2 = _call(api_old, pn, session)
+                    if code2 == 0 and vlist2:
+                        vlist = vlist2
+            except Exception:
+                vlist = []
 
-        for v in vlist:
-            bvid = v.get("bvid")
-            if not bvid:
-                continue
-            out.append({
-                "bvid": bvid,
-                "title": v.get("title", ""),
-                "pubdate": pd.to_datetime(v.get("created", 0), unit="s", errors="coerce"),
-                "view": _safe_int(v.get("play", 0)),
-                "reply": _safe_int(v.get("comment", 0)),
-            })
-            if len(out) >= n:
+            if not vlist:
                 break
-        pn += 1
+
+            for v in vlist:
+                row = _as_video_row(v)
+                if row:
+                    rows.append(row)
+                if len(rows) >= n:
+                    break
+            pn += 1
+            _sleep_jitter(sleep_sec)
+        return _dedupe_rows(rows, n)
+
+    # A. API + 主页cookie
+    out = _api_loop(sess)
+    if len(out) >= max(1, min(n, 3)):
+        return out[:n]
+
+    # B. 直接读取空间页HTML兜底
+    try:
+        html = sess.get(space_url, timeout=12).text
+        html_rows = _extract_video_rows_from_html(html, n=n)
+        out = _dedupe_rows(out + html_rows, n)
+        if len(out) >= max(1, min(n, 3)):
+            return out[:n]
+    except Exception:
+        pass
+
+    # C. 可选无头浏览器打开UP主页，拿浏览器cookie后重试
+    if use_browser_fallback:
+        html, browser_cookies = _open_space_with_headless_browser(mid)
+        if browser_cookies:
+            for k, v in browser_cookies.items():
+                try:
+                    sess.cookies.set(k, v, domain=".bilibili.com")
+                except Exception:
+                    sess.cookies.set(k, v)
+            more = _api_loop(sess)
+            out = _dedupe_rows(out + more, n)
+        if html:
+            out = _dedupe_rows(out + _extract_video_rows_from_html(html, n=n), n)
 
     return out[:n]
 
@@ -915,6 +1100,7 @@ with st.expander("KOL模块设置", expanded=False):
     collab_projects = st.multiselect("哪些项目算合作项目", projects, default=sel_projects if sel_projects else projects)
     fetch_n = st.slider("补齐基准：每个KOL抓取最近N条公开视频", 10, 80, 30, step=5)
     sleep_sec = st.slider("抓取间隔（防限流）", 0.2, 2.0, 0.8, step=0.1)
+    use_browser_fallback = st.checkbox("启用类浏览器/无头浏览器兜底抓取UP主页（推荐）", value=True)
     show_kol_quality_hint = st.checkbox("显示数据质量提示（缺mid/异常mid）", value=False)
 
 cA, cB, cC = st.columns([1, 1, 2])
@@ -923,7 +1109,7 @@ with cA:
 with cB:
     btn_build_kol = st.button("📚 生成KOL对比表（含标注）")
 with cC:
-    st.caption("本版关键：KOL基准抓取使用WBI签名，显著降低“主页有视频但抓不到”的概率。")
+    st.caption("本版关键：WBI签名 + 主页Cookie预热 + HTML提取BV + 可选无头浏览器兜底，降低‘主页有视频但接口为空’的问题。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
@@ -960,7 +1146,7 @@ if collab_projects:
         for mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
             disp = name_map.get(mid, "")
             try:
-                vlist = fetch_vlist_by_mid(int(mid), n=int(fetch_n))
+                vlist = fetch_vlist_by_mid(int(mid), n=int(fetch_n), use_browser_fallback=bool(use_browser_fallback), sleep_sec=float(sleep_sec))
             except Exception:
                 stat["list_fail"] += 1
                 continue
