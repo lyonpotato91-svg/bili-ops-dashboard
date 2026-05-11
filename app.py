@@ -462,10 +462,32 @@ def _apply_cookie_to_session(sess: requests.Session, cookie: str = "") -> reques
     return sess
 
 
-def _make_bili_session(referer: str = "https://www.bilibili.com/", cookie: str = "") -> requests.Session:
+def _normalize_proxy_url(proxy: str = "") -> str:
+    """把用户填写的代理地址规范化；允许 127.0.0.1:7890 这类简写。"""
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    if proxy.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        return proxy
+    # requests 的 proxies 需要 scheme；本地 Clash/Surge 常见写法默认按 http 代理处理
+    return "http://" + proxy
+
+
+def _apply_proxy_to_session(sess: requests.Session, proxy: str = "") -> requests.Session:
+    proxy_url = _normalize_proxy_url(proxy)
+    if proxy_url:
+        sess.proxies.update({"http": proxy_url, "https": proxy_url})
+    return sess
+
+
+def _make_bili_session(
+    referer: str = "https://www.bilibili.com/",
+    cookie: str = "",
+    proxy: str = "",
+) -> requests.Session:
     """
-    为每次抓取建立带常见浏览器头与基础cookie的 Session。
-    目标不是绕过风控，而是让请求上下文更接近真实浏览器访问，减少接口偶发空列表。
+    为每次抓取建立带常见浏览器头、可选 Cookie、可选代理的 Session。
+    proxy 参数是 KOL 模块新增配置；必须在这里接收，否则点击“一键补齐”会 TypeError。
     """
     sess = requests.Session()
     h = HEADERS.copy()
@@ -479,9 +501,11 @@ def _make_bili_session(referer: str = "https://www.bilibili.com/", cookie: str =
     })
     sess.headers.update(h)
     _apply_cookie_to_session(sess, cookie)
+    _apply_proxy_to_session(sess, proxy)
     try:
         sess.get("https://www.bilibili.com/", timeout=8)
     except Exception:
+        # 预热失败不应让页面崩溃，后续具体接口会在诊断日志中记录失败原因。
         pass
     return sess
 
