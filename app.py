@@ -462,18 +462,18 @@ def _apply_cookie_to_session(sess: requests.Session, cookie: str = "") -> reques
     return sess
 
 
-def _normalize_proxy(proxy: str = "") -> str:
-    """把用户输入的代理地址规范化；留空则不使用代理。"""
+def _normalize_proxy_url(proxy: str = "") -> str:
+    """规范化代理地址；用户填 127.0.0.1:7890 时自动补 http://。"""
     proxy = (proxy or "").strip()
     if not proxy:
         return ""
-    if proxy.startswith(("http://", "https://", "socks5://", "socks5h://")):
-        return proxy
-    return "http://" + proxy
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", proxy):
+        proxy = "http://" + proxy
+    return proxy
 
 
 def _apply_proxy_to_session(sess: requests.Session, proxy: str = "") -> requests.Session:
-    proxy = _normalize_proxy(proxy)
+    proxy = _normalize_proxy_url(proxy)
     if proxy:
         sess.proxies.update({"http": proxy, "https": proxy})
     return sess
@@ -482,7 +482,7 @@ def _apply_proxy_to_session(sess: requests.Session, proxy: str = "") -> requests
 def _make_bili_session(referer: str = "https://www.bilibili.com/", cookie: str = "", proxy: str = "") -> requests.Session:
     """
     为每次抓取建立带常见浏览器头、可选 Cookie、可选代理的 Session。
-    Cookie/代理只在用户主动填写时生效，避免把敏感信息写入代码。
+    注意：浏览器开 VPN 不等于 Streamlit/Python requests 也走 VPN；本地运行需要显式填代理。
     """
     sess = requests.Session()
     h = HEADERS.copy()
@@ -500,7 +500,7 @@ def _make_bili_session(referer: str = "https://www.bilibili.com/", cookie: str =
     try:
         sess.get("https://www.bilibili.com/", timeout=8)
     except Exception:
-        # 预热失败不应让页面崩溃；后续接口诊断会记录真实失败原因
+        # 预热失败不应导致页面崩溃，后续诊断日志会展示具体接口失败原因
         pass
     return sess
 
@@ -888,224 +888,82 @@ def _fetch_vlist_by_mid_app_cursor(mid: int, n: int, sess: requests.Session, sle
     return []
 
 
-def _extract_bvids_recursive(obj, limit: int = 120) -> list[str]:
-    """从任意 JSON/HTML 片段递归提取 BV，供动态/合集/搜索兜底使用。"""
-    out, seen = [], set()
 
-    def add_from_text(text: str):
-        for bv in re.findall(r"BV[0-9A-Za-z]{10}", _safe_str(text)):
-            if bv not in seen:
-                seen.add(bv)
-                out.append(bv)
-                if len(out) >= limit:
-                    return
-
-    def walk(x):
-        if len(out) >= limit:
-            return
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if str(k).lower() in {"bvid", "bvidstr"}:
-                    add_from_text(v)
-                else:
-                    walk(v)
-                if len(out) >= limit:
-                    return
-        elif isinstance(x, (list, tuple)):
-            for item in x:
-                walk(item)
-                if len(out) >= limit:
-                    return
-        elif isinstance(x, str):
-            add_from_text(x)
-
-    walk(obj)
-    return out[:limit]
-
-
-def _detail_rows_from_bvids(
-    bvids: list[str],
-    owner_mid: int | str,
+def _fetch_vlist_by_owner_search(
+    mid: int,
+    owner_name: str,
     n: int,
     sess: requests.Session,
     sleep_sec: float,
+    cookie: str = "",
+    proxy: str = "",
     debug: list | None = None,
-    source: str = "detail_filter",
 ) -> list[dict]:
-    """用视频详情接口反查 owner_mid，只保留目标 UP 自己的视频，避免搜索/动态串号。"""
-    target_mid = _norm_mid(owner_mid)
-    rows = []
-    seen = set()
-    for bvid in bvids:
-        if len(rows) >= n:
-            break
-        bvid = parse_bvid(_safe_str(bvid)) or _safe_str(bvid)
-        if not bvid or bvid in seen:
-            continue
-        seen.add(bvid)
-        detail = fetch_video_detail_by_bvid(bvid, sess=sess)
-        if detail is None:
-            _log_kol_debug(debug, source, False, f"detail_fail {bvid}", 0, "DETAIL")
-            _sleep_jitter(min(float(sleep_sec), 0.8))
-            continue
-        got_mid = _norm_mid(detail.get("owner_mid", ""))
-        if target_mid and got_mid != target_mid:
-            _log_kol_debug(debug, source, False, f"skip_other_owner {bvid} owner_mid={got_mid}", 0, "FILTER")
-            _sleep_jitter(min(float(sleep_sec), 0.8))
-            continue
-        rows.append({
-            "bvid": detail.get("bvid", bvid),
-            "title": detail.get("title", ""),
-            "pubdate": detail.get("pubdate", pd.NaT),
-            "view": _safe_int(detail.get("view", 0)),
-            "reply": _safe_int(detail.get("reply", 0)),
-            "like": _safe_int(detail.get("like", 0)),
-            "coin": _safe_int(detail.get("coin", 0)),
-            "favorite": _safe_int(detail.get("favorite", 0)),
-            "danmaku": _safe_int(detail.get("danmaku", 0)),
-            "share": _safe_int(detail.get("share", 0)),
-        })
-        _sleep_jitter(min(float(sleep_sec), 0.8))
-    _log_kol_debug(debug, source, bool(rows), f"verified={len(rows)}", len(rows), "OK" if rows else "EMPTY")
-    return _dedupe_rows(rows, n)
-
-
-def _fetch_vlist_by_mid_collection(mid: int, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
-    """合集/系列兜底。部分 UP 的普通投稿接口为空，但合集页仍能暴露 archives。"""
-    rows = []
-    space_url = f"https://space.bilibili.com/{mid}/video"
-    list_api = "https://api.bilibili.com/x/polymer/web-space/seasons_series_list"
-    archive_api = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
-    try:
-        params = _wbi_sign({"mid": mid, "page_num": 1, "page_size": 20, "web_location": "333.1387"})
-        r = sess.get(list_api, params=params, headers={"Referer": space_url}, timeout=12)
-        j = r.json()
-        code = j.get("code", -1)
-        data = j.get("data") or {}
-        bvids = _extract_bvids_recursive(data, limit=n)
-        if bvids:
-            rows.extend(_detail_rows_from_bvids(bvids, mid, n - len(rows), sess, sleep_sec, debug, source="collection_list_detail_filter"))
-        # 如果 list 内没有直接给 BV，再尝试 season/series archive 子接口
-        ids = []
-        for key in ["seasons_list", "series_list", "items_lists", "items"]:
-            part = data.get(key) if isinstance(data, dict) else None
-            if isinstance(part, dict):
-                for sub in part.values():
-                    if isinstance(sub, list):
-                        for it in sub:
-                            if isinstance(it, dict):
-                                sid = it.get("season_id") or it.get("series_id") or it.get("id") or it.get("meta_id")
-                                if sid and sid not in ids:
-                                    ids.append(sid)
-            elif isinstance(part, list):
-                for it in part:
-                    if isinstance(it, dict):
-                        sid = it.get("season_id") or it.get("series_id") or it.get("id") or it.get("meta_id")
-                        if sid and sid not in ids:
-                            ids.append(sid)
-        for sid in ids[:8]:
-            if len(rows) >= n:
-                break
-            for pn in range(1, 4):
-                if len(rows) >= n:
-                    break
-                try:
-                    p = _wbi_sign({"mid": mid, "season_id": sid, "series_id": sid, "page_num": pn, "page_size": 30, "sort_reverse": "false", "web_location": "333.1387"})
-                    rr = sess.get(archive_api, params=p, headers={"Referer": space_url}, timeout=12)
-                    jj = rr.json()
-                    bvs = _extract_bvids_recursive(jj.get("data") or jj, limit=n)
-                    if not bvs:
-                        break
-                    rows.extend(_detail_rows_from_bvids(bvs, mid, n - len(rows), sess, sleep_sec, debug, source="collection_archive_detail_filter"))
-                    _sleep_jitter(sleep_sec)
-                except Exception as e:
-                    _log_kol_debug(debug, "collection_archive", False, f"sid={sid} pn={pn}: {type(e).__name__}: {e}", 0, "EXC")
-                    break
-        _log_kol_debug(debug, "collection_series", bool(rows), f"code={code}; rows={len(rows)}", len(rows), code)
-    except Exception as e:
-        _log_kol_debug(debug, "collection_series", False, f"{type(e).__name__}: {e}", 0, "EXC")
-    return _dedupe_rows(rows, n)
-
-
-def _fetch_vlist_by_mid_dynamic(mid: int, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
-    """空间动态兜底：动态里常含投稿卡片；最终仍用详情接口校验 owner_mid。"""
-    api = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
-    space_url = f"https://space.bilibili.com/{mid}/dynamic"
-    rows = []
-    offset = ""
-    for page_i in range(1, 6):
-        if len(rows) >= n:
-            break
-        params = {"host_mid": mid, "timezone_offset": -480, "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote", "web_location": "333.999"}
-        if offset:
-            params["offset"] = offset
-        try:
-            signed = _wbi_sign(params)
-            r = sess.get(api, params=signed, headers={"Referer": space_url}, timeout=12)
-            j = r.json()
-            code = j.get("code", -1)
-            data = j.get("data") or {}
-            items = data.get("items") or []
-            bvids = _extract_bvids_recursive(items, limit=n * 2)
-            if bvids:
-                rows.extend(_detail_rows_from_bvids(bvids, mid, n - len(rows), sess, sleep_sec, debug, source="dynamic_detail_filter"))
-            _log_kol_debug(debug, "dynamic_space", bool(bvids), f"page={page_i}; bvids={len(bvids)}", len(bvids), code)
-            offset = data.get("offset") or data.get("history_offset") or ""
-            if not offset or not data.get("has_more", False):
-                break
-        except Exception as e:
-            _log_kol_debug(debug, "dynamic_space", False, f"page={page_i}: {type(e).__name__}: {e}", 0, "EXC")
-            break
-        _sleep_jitter(sleep_sec)
-    return _dedupe_rows(rows, n)
-
-
-def _fetch_vlist_by_name_search(owner_name: str, mid: int, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
-    """昵称搜索兜底：搜索召回后用详情接口按 owner_mid 严格过滤。"""
+    """用 UP 昵称做全站视频搜索，再用详情接口反查 owner_mid，严格过滤串号。"""
     owner_name = _safe_str(owner_name).strip()
     if not owner_name:
-        _log_kol_debug(debug, "name_search", False, "empty owner_name", 0, "SKIP")
+        _log_kol_debug(debug, "owner_video_search", False, "skip: empty owner_name", 0, "NO_NAME")
         return []
-    api = "https://api.bilibili.com/x/web-interface/wbi/search/type"
-    rows, candidates = [], []
-    for page_i in range(1, 6):
+
+    api = "https://api.bilibili.com/x/web-interface/search/type"
+    rows = []
+    seen = set()
+    for page in range(1, 5):
         if len(rows) >= n:
             break
         params = {
             "search_type": "video",
             "keyword": owner_name,
-            "page": page_i,
-            "page_size": 30,
             "order": "pubdate",
-            "duration": 0,
-            "tids": 0,
-            "web_location": "1430654",
+            "page": page,
+            "page_size": 20,
+            "platform": "web",
         }
         try:
-            signed = _wbi_sign(params)
-            r = sess.get(api, params=signed, headers={"Referer": "https://search.bilibili.com/"}, timeout=12)
+            r = sess.get(api, params=params, headers={"Referer": "https://search.bilibili.com/"}, timeout=12)
             j = r.json()
             code = j.get("code", -1)
-            data = j.get("data") or {}
-            result = data.get("result") or []
+            result = ((j.get("data") or {}).get("result")) or []
+            if code != 0 or not result:
+                msg = j.get("message") or json.dumps(j.get("data") or {}, ensure_ascii=False)[:120]
+                _log_kol_debug(debug, "owner_video_search", False, f"page={page}: {msg}", 0, code)
+                if page == 1:
+                    break
+                continue
+
+            checked = 0
+            matched = 0
             for item in result:
-                # result 里有时带 mid/author；能快速过滤就先过滤，不能则交给详情接口
-                item_mid = _norm_mid(item.get("mid", "")) if isinstance(item, dict) else ""
-                if item_mid and item_mid != _norm_mid(mid):
+                bvid = item.get("bvid") or parse_bvid(_safe_str(item.get("arcurl") or item.get("url") or ""))
+                if not bvid or bvid in seen:
                     continue
-                row = _as_video_row(item)
-                if row and row.get("bvid"):
-                    candidates.append(row["bvid"])
-            _log_kol_debug(debug, "name_search", bool(result), f"page={page_i}; result={len(result)}; candidates={len(candidates)}", len(result), code)
-            if not result:
-                break
-            rows = _dedupe_rows(rows + _detail_rows_from_bvids(candidates, mid, n - len(rows), sess, sleep_sec, debug, source="search_detail_filter"), n)
+                seen.add(bvid)
+                checked += 1
+                detail = fetch_video_detail_by_bvid(bvid, sess=sess, cookie=cookie, proxy=proxy)
+                if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
+                    rows.append({
+                        "bvid": bvid,
+                        "title": detail.get("title", item.get("title", "")),
+                        "pubdate": detail.get("pubdate", pd.NaT),
+                        "view": _safe_int(detail.get("view", _bili_num_to_int(item.get("play", 0)))),
+                        "reply": _safe_int(detail.get("reply", 0)),
+                        "like": _safe_int(detail.get("like", 0)),
+                        "coin": _safe_int(detail.get("coin", 0)),
+                        "favorite": _safe_int(detail.get("favorite", 0)),
+                        "danmaku": _safe_int(detail.get("danmaku", 0)),
+                        "share": _safe_int(detail.get("share", 0)),
+                    })
+                    matched += 1
+                    if len(rows) >= n:
+                        break
+                _sleep_jitter(0.18)
+            _log_kol_debug(debug, "owner_video_search", matched > 0, f"page={page}, checked={checked}, matched_mid={matched}", matched, code)
         except Exception as e:
-            _log_kol_debug(debug, "name_search", False, f"page={page_i}: {type(e).__name__}: {e}", 0, "EXC")
-            break
+            _log_kol_debug(debug, "owner_video_search", False, f"page={page}: {type(e).__name__}: {e}", 0, "EXC")
+            if page == 1:
+                break
         _sleep_jitter(sleep_sec)
     return _dedupe_rows(rows, n)
-
 
 def fetch_vlist_by_mid(
     mid: int,
@@ -1118,9 +976,8 @@ def fetch_vlist_by_mid(
     debug: list | None = None,
 ) -> list[dict]:
     """
-    KOL近期公开视频列表抓取增强版：完整聚合多路径，直到补满 n 条才停止。\n
-    路径：Web WBI投稿 → 老投稿 → APP cursor → 合集/系列 → 动态流 → 昵称搜索 → HTML BV → Selenium。
-    所有非投稿列表来源都会通过视频详情反查 owner_mid，避免串号。
+    KOL公开视频列表抓取：多路径聚合，不再“抓到3条就提前返回”。
+    目标是尽量补满 N 条，同时每一路都写入诊断日志，方便定位到底卡在哪个接口。
     """
     space_url = f"https://space.bilibili.com/{mid}/video"
     sess = _make_bili_session(referer=space_url, cookie=cookie, proxy=proxy)
@@ -1132,37 +989,45 @@ def fetch_vlist_by_mid(
         _log_kol_debug(debug, "space_warmup", False, f"{type(e).__name__}: {e}", 0, "EXC")
 
     out = []
-    fetchers = [
-        ("web_wbi", lambda: _fetch_vlist_by_mid_web_wbi(mid, n - len(out), sess, sleep_sec, debug)),
-        ("web_old", lambda: _fetch_vlist_by_mid_web_old(mid, n - len(out), sess, sleep_sec, debug)),
-        ("app_cursor", lambda: _fetch_vlist_by_mid_app_cursor(mid, n - len(out), sess, sleep_sec, debug)),
-        ("collection", lambda: _fetch_vlist_by_mid_collection(mid, n - len(out), sess, sleep_sec, debug)),
-        ("dynamic", lambda: _fetch_vlist_by_mid_dynamic(mid, n - len(out), sess, sleep_sec, debug)),
-        ("name_search", lambda: _fetch_vlist_by_name_search(owner_name, mid, n - len(out), sess, sleep_sec, debug)),
-    ]
-    for source_name, fn in fetchers:
-        if len(out) >= n:
-            break
-        try:
-            more = fn()
-            out = _dedupe_rows(out + more, n)
-            _log_kol_debug(debug, f"aggregate_{source_name}", bool(more), f"added={len(more)} total={len(out)}/{n}", len(more), "OK" if more else "EMPTY")
-        except Exception as e:
-            _log_kol_debug(debug, f"aggregate_{source_name}", False, f"{type(e).__name__}: {e}", 0, "EXC")
-        _sleep_jitter(min(float(sleep_sec), 0.8))
 
-    # HTML 兜底：只提 BV，再用详情校验 owner_mid
+    def _merge(rows, source_name: str):
+        nonlocal out
+        before = len(out)
+        out = _dedupe_rows(out + (rows or []), n)
+        added = len(out) - before
+        if added > 0:
+            _log_kol_debug(debug, source_name + "_merge", True, f"added={added}, total={len(out)}", added, "MERGE")
+
+    # 1. Web WBI 投稿接口
+    _merge(_fetch_vlist_by_mid_web_wbi(mid, n, sess, sleep_sec, debug), "web_wbi_arc_search")
+    # 2. 老 Web 投稿接口
+    if len(out) < n:
+        _merge(_fetch_vlist_by_mid_web_old(mid, n, sess, sleep_sec, debug), "web_old_arc_search")
+    # 3. APP cursor 投稿接口
+    if len(out) < n:
+        _merge(_fetch_vlist_by_mid_app_cursor(mid, n, sess, sleep_sec, debug), "app_archive_cursor")
+    # 4. 昵称搜索兜底：用于空间投稿接口被风控/为空的账号
+    if len(out) < n:
+        _merge(_fetch_vlist_by_owner_search(mid, owner_name, n, sess, sleep_sec, cookie=cookie, proxy=proxy, debug=debug), "owner_video_search")
+    # 5. HTML BV 提取兜底
     if len(out) < n:
         try:
             html = sess.get(space_url, timeout=12).text
-            html_bvids = _extract_bvids_recursive(html, limit=n * 2)
-            html_rows = _detail_rows_from_bvids(html_bvids, mid, n - len(out), sess, sleep_sec, debug, source="space_html_detail_filter")
-            out = _dedupe_rows(out + html_rows, n)
-            _log_kol_debug(debug, "space_html_bv_extract", bool(html_rows), f"html_bv={len(html_bvids)}; added={len(html_rows)}", len(html_rows), "OK" if html_rows else "EMPTY")
+            html_rows = _extract_video_rows_from_html(html, n=n, cookie=cookie, proxy=proxy)
+            _log_kol_debug(debug, "space_html_bv_extract", bool(html_rows), f"html_bv={len(html_rows)}", len(html_rows), "")
+            # HTML 抽取也要用详情过滤 owner_mid，避免页面推荐视频串号
+            filtered = []
+            for row in html_rows:
+                bv = row.get("bvid")
+                detail = fetch_video_detail_by_bvid(bv, sess=sess, cookie=cookie, proxy=proxy) if bv else None
+                if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
+                    filtered.append(row)
+            _merge(filtered, "space_html_bv_extract")
         except Exception as e:
             _log_kol_debug(debug, "space_html_bv_extract", False, f"{type(e).__name__}: {e}", 0, "EXC")
 
-    if use_browser_fallback and len(out) < n:
+    # 6. 可选 Selenium，无依赖时静默跳过
+    if len(out) < n and use_browser_fallback:
         html, browser_cookies = _open_space_with_headless_browser(mid)
         if browser_cookies:
             for k, v in browser_cookies.items():
@@ -1170,15 +1035,18 @@ def fetch_vlist_by_mid(
                     sess.cookies.set(k, v, domain=".bilibili.com")
                 except Exception:
                     sess.cookies.set(k, v)
-            more = _fetch_vlist_by_mid_web_wbi(mid, n - len(out), sess, sleep_sec, debug)
-            out = _dedupe_rows(out + more, n)
+            _merge(_fetch_vlist_by_mid_web_wbi(mid, n, sess, sleep_sec, debug), "selenium_web_wbi")
         if html and len(out) < n:
-            html_bvids = _extract_bvids_recursive(html, limit=n * 2)
-            html_rows = _detail_rows_from_bvids(html_bvids, mid, n - len(out), sess, sleep_sec, debug, source="selenium_html_detail_filter")
-            out = _dedupe_rows(out + html_rows, n)
-            _log_kol_debug(debug, "selenium_html_bv_extract", bool(html_rows), f"html_bv={len(html_bvids)}; added={len(html_rows)}", len(html_rows), "OK" if html_rows else "EMPTY")
+            html_rows = _extract_video_rows_from_html(html, n=n, cookie=cookie, proxy=proxy)
+            _log_kol_debug(debug, "selenium_html_bv_extract", bool(html_rows), f"html_bv={len(html_rows)}", len(html_rows), "")
+            _merge(html_rows, "selenium_html_bv_extract")
 
+    if not out:
+        _log_kol_debug(debug, "final", False, "all sources returned empty; likely hidden archive, search miss, or interface risk-control", 0, "EMPTY")
+    else:
+        _log_kol_debug(debug, "final", True, f"final_count={len(out)}", len(out), "OK")
     return out[:n]
+
 
 def _detail_row_for_project(detail: dict, project: str, url: str = "", data_type: str = "collab", baseline_for: str = "") -> dict:
     """把详情接口结果统一转成数据库行。"""
@@ -1607,113 +1475,111 @@ else:
 st.write("\n".join(insights))
 
 
+
 # =========================
-# KOL 对比评分 + 可视化
+# KOL scoring + visual layer
 # =========================
 KOL_GRADE_ORDER = ["A 重点续约", "B 可继续", "C 待观察", "D 谨慎投放", "E 无法判断"]
 KOL_GRADE_COLORS = {
-    "A 重点续约": "#2ca02c",   # 绿色：明确优先
-    "B 可继续": "#1f77b4",     # 蓝色：继续合作
-    "C 待观察": "#ff7f0e",     # 橙色：观察验证
-    "D 谨慎投放": "#d62728",   # 红色：风险/收缩
-    "E 无法判断": "#7f7f7f",   # 灰色：无基准
+    "A 重点续约": "#009E73",  # green
+    "B 可继续": "#0072B2",    # blue
+    "C 待观察": "#E69F00",    # orange
+    "D 谨慎投放": "#D55E00",  # vermillion/red
+    "E 无法判断": "#7F7F7F",  # gray
+}
+KOL_GRADE_DESC = {
+    "A 重点续约": "播放/互动/沉淀综合强，可优先续投或放量",
+    "B 可继续": "整体可投，但仍需看素材或样本可靠性",
+    "C 待观察": "有单项亮点或样本不稳，适合小额验证",
+    "D 谨慎投放": "综合偏弱或互动质量不足，建议收缩",
+    "E 无法判断": "没有有效基准，不做投放强判断",
 }
 
 
-def _lift_value(current: float, baseline: float) -> float:
+def _safe_float(x, default=np.nan) -> float:
     try:
-        current = float(current)
-        baseline = float(baseline)
-        if np.isnan(current) or np.isnan(baseline) or baseline <= 0:
-            return np.nan
-        return current / baseline - 1.0
+        if x is None or pd.isna(x):
+            return default
+        return float(x)
     except Exception:
+        return default
+
+
+def _lift_value(collab: float, base: float) -> float:
+    base = _safe_float(base)
+    collab = _safe_float(collab)
+    if np.isnan(base) or base <= 0 or np.isnan(collab):
         return np.nan
+    return collab / base - 1.0
 
 
 def _fmt_lift(x) -> str:
-    try:
-        x = float(x)
-        if np.isnan(x):
-            return "-"
-        return f"{x*100:.1f}%"
-    except Exception:
+    x = _safe_float(x)
+    if np.isnan(x):
         return "-"
+    return f"{x * 100:.1f}%"
 
 
 def _fmt_rate(x) -> str:
-    try:
-        x = float(x)
-        if np.isnan(x):
-            return "-"
-        return f"{x*100:.2f}%"
-    except Exception:
+    x = _safe_float(x)
+    if np.isnan(x):
         return "-"
+    return f"{x * 100:.2f}%"
 
 
-def _score_component(lift: float, scale: float) -> float:
-    """把提升值映射到 0-100；0%提升约等于 50 分，避免极端播放提升无限拉高。"""
-    try:
-        lift = float(lift)
-        if np.isnan(lift):
-            return 50.0
-        return float(np.clip(50 + 45 * np.tanh(lift / scale), 0, 100))
-    except Exception:
+def _score_component(lift: float, pos_cap: float = 1.2, neg_cap: float = -0.8) -> float:
+    """0% 提升=50分；正向封顶，负向扣分。"""
+    x = _safe_float(lift)
+    if np.isnan(x):
         return 50.0
-
-
-def _grade_from_score(score: float) -> str:
-    try:
-        score = float(score)
-        if np.isnan(score):
-            return "E 无法判断"
-    except Exception:
-        return "E 无法判断"
-    if score >= 80:
-        return "A 重点续约"
-    if score >= 65:
-        return "B 可继续"
-    if score >= 50:
-        return "C 待观察"
-    return "D 谨慎投放"
+    if x >= 0:
+        return 50.0 + 50.0 * min(x, pos_cap) / pos_cap
+    return 50.0 * (1.0 - min(abs(x), abs(neg_cap)) / abs(neg_cap))
 
 
 def _recommendation(view_lift: float, er_lift: float, deep_lift: float, base_type: str, sample_n: int, min_n: int) -> tuple[str, float]:
-    """推荐等级完全由最终分数决定，保证颜色、评级、分数三者一致。"""
+    """统一的 ABCDE 分级：推荐等级完全由综合评分/可判断性映射。"""
     if base_type == "无基准":
         return "E 无法判断", np.nan
 
-    view_score = _score_component(view_lift, 1.20)
-    er_score = _score_component(er_lift, 0.70)
-    deep_score = _score_component(deep_lift, 0.80)
-    score = 0.50 * view_score + 0.35 * er_score + 0.15 * deep_score
+    view_score = _score_component(view_lift, pos_cap=1.4, neg_cap=-0.9)
+    er_score = _score_component(er_lift, pos_cap=0.9, neg_cap=-0.7)
+    deep_score = _score_component(deep_lift, pos_cap=0.9, neg_cap=-0.7)
 
-    # 质量约束：播放爆量但互动明显下滑，不允许进入高等级。
-    if not np.isnan(er_lift) and er_lift <= -0.25:
-        score = min(score, 59.0)
-    if not np.isnan(view_lift) and view_lift <= -0.35:
-        score = min(score, 59.0)
-    if (not np.isnan(er_lift) and er_lift <= -0.45) and (not np.isnan(deep_lift) and deep_lift <= -0.35):
-        score = min(score, 49.0)
+    # 互动质量权重高于播放，避免“高播放低互动”被误判为强推荐。
+    score = 0.35 * view_score + 0.45 * er_score + 0.20 * deep_score
 
-    # 样本可靠性约束：小样本/替代基准不能直接给 A。
+    # 样本可靠性折扣，但不创造新的分类；可靠性只进表格，不进图例。
     if base_type == "平台替代基准":
-        score = min(score, 69.0)
+        score = 50.0 + (score - 50.0) * 0.72
+        score = min(score, 74.0)
     elif sample_n < min_n:
+        score = 50.0 + (score - 50.0) * 0.84
         score = min(score, 74.0)
 
+    # 质量红线：互动明显下滑时限分。
+    e = _safe_float(er_lift)
+    v = _safe_float(view_lift)
+    d = _safe_float(deep_lift)
+    if not np.isnan(e) and e <= -0.55:
+        score = min(score, 42.0)
+    elif not np.isnan(e) and e <= -0.30:
+        score = min(score, 58.0)
+    if not np.isnan(v) and v <= -0.55:
+        score = min(score, 44.0)
+    if not np.isnan(d) and d <= -0.55:
+        score = min(score, 58.0)
+
     score = float(np.clip(score, 0, 100))
-    return _grade_from_score(score), score
-
-
-def _baseline_reliability(base_type: str, sample_n: int, min_n: int) -> str:
-    if base_type == "KOL历史基准" and sample_n >= min_n:
-        return "高：KOL历史足量"
-    if base_type == "KOL历史小样本":
-        return f"中：KOL历史小样本({sample_n}/{min_n})"
-    if base_type == "平台替代基准":
-        return "低：平台替代基准"
-    return "无：无法判断"
+    if score >= 75:
+        grade = "A 重点续约"
+    elif score >= 60:
+        grade = "B 可继续"
+    elif score >= 45:
+        grade = "C 待观察"
+    else:
+        grade = "D 谨慎投放"
+    return grade, score
 
 
 def _build_kol_compare_lib(
@@ -1724,10 +1590,10 @@ def _build_kol_compare_lib(
     name_map: dict | None = None,
     use_proxy_baseline: bool = True,
 ) -> pd.DataFrame:
-    """生成 KOL 对比库；个人基准不足时用明确标注的平台替代基准兜底，不让汇报页空白。"""
+    """生成 KOL 对比库。优先使用 KOL 自身历史；自身历史为0时可用平台替代基准，并明确标注。"""
     if df_all_m is None or df_all_m.empty:
         return pd.DataFrame()
-    df_all_m = compute_metrics(df_all_m.copy())
+    df_all_m = compute_metrics(normalize_df(df_all_m.copy()))
     df_all_m["owner_mid"] = df_all_m["owner_mid"].apply(_norm_mid)
     collab_set = set(collab_projects or [])
     name_map = name_map or {}
@@ -1737,10 +1603,10 @@ def _build_kol_compare_lib(
     if collab_mid_df.empty:
         return pd.DataFrame()
 
-    # 平台替代基准：全库中非本次合作项目的视频，排除明显无效播放。
     proxy_pool = df_all_m[(~df_all_m["project"].isin(collab_set)) | (df_all_m["project"] == BASELINE_PROJECT)].copy()
-    proxy_pool = proxy_pool[proxy_pool["view"].astype(float) > 0].drop_duplicates(subset=["owner_mid", "bvid"], keep="last")
-    proxy_pool = _sort_owner_hist(proxy_pool).head(max(baseline_window_n * 20, 120)) if not proxy_pool.empty else proxy_pool
+    proxy_pool = proxy_pool[proxy_pool["view"].astype(float) > 0]
+    proxy_pool = proxy_pool.drop_duplicates(subset=["owner_mid", "bvid"], keep="last")
+    proxy_pool = _sort_owner_hist(proxy_pool).head(max(120, baseline_window_n * 20)) if not proxy_pool.empty else proxy_pool
 
     rows = []
     for mid, g_collab in collab_mid_df.groupby("owner_mid"):
@@ -1759,60 +1625,78 @@ def _build_kol_compare_lib(
         if len(own_base) >= baseline_min_n:
             base_pool = own_base
             base_type = "KOL历史基准"
+            reliability = "高"
         elif len(own_base) > 0:
             base_pool = own_base
             base_type = "KOL历史小样本"
+            reliability = "中"
         elif use_proxy_baseline and proxy_pool is not None and not proxy_pool.empty:
             base_pool = proxy_pool.head(baseline_window_n)
             base_type = "平台替代基准"
+            reliability = "低"
         else:
             base_pool = pd.DataFrame()
             base_type = "无基准"
+            reliability = "无"
 
-        collab_view = float(g_collab["view"].median()) if not g_collab.empty else np.nan
-        collab_er = float(g_collab["engagement_rate"].median()) if not g_collab.empty else np.nan
-        collab_deep = float(g_collab["deep_signal_ratio"].median()) if not g_collab.empty else np.nan
+        collab_view = _safe_float(g_collab["view"].median())
+        collab_er = _safe_float(g_collab["engagement_rate"].median())
+        collab_deep = _safe_float(g_collab["deep_signal_ratio"].median())
 
         if base_pool.empty:
             base_view = base_er = base_deep = np.nan
         else:
-            base_view = float(base_pool["view"].median())
-            base_er = float(base_pool["engagement_rate"].median())
-            base_deep = float(base_pool["deep_signal_ratio"].median())
+            base_view = _safe_float(base_pool["view"].median())
+            base_er = _safe_float(base_pool["engagement_rate"].median())
+            base_deep = _safe_float(base_pool["deep_signal_ratio"].median())
 
         view_lift = _lift_value(collab_view, base_view)
         er_lift = _lift_value(collab_er, base_er)
         deep_lift = _lift_value(collab_deep, base_deep)
-        rec, score = _recommendation(view_lift, er_lift, deep_lift, base_type, len(base_pool), baseline_min_n)
-        reliability = _baseline_reliability(base_type, len(base_pool), baseline_min_n)
+        grade, score = _recommendation(view_lift, er_lift, deep_lift, base_type, len(base_pool), baseline_min_n)
 
         mark = kol_flag(view_lift, er_lift, deep_lift)
         if base_type == "平台替代基准":
-            mark = "🟡 替代基准待验证"
+            mark = "🟡 平台替代基准"
         elif base_type == "KOL历史小样本":
             mark = mark or "🔎 小样本可读"
         elif base_type == "无基准":
             mark = "⚪ 无基准"
 
         tags = []
-        if not np.isnan(view_lift) and view_lift >= 0.30: tags.append("热度拉升")
-        if not np.isnan(er_lift) and er_lift >= 0.20: tags.append("互动增强")
-        if not np.isnan(deep_lift) and deep_lift >= 0.10: tags.append("沉淀提升")
-        if not tags: tags.append("常规")
-        persona = f"{'热度拉升' if '热度拉升' in tags else '热度稳定'} + {'互动增强' if '互动增强' in tags else '互动常规'} + {'沉淀提升' if '沉淀提升' in tags else '沉淀一般'}"
+        if not np.isnan(view_lift) and view_lift >= 0.30:
+            tags.append("热度拉升")
+        if not np.isnan(er_lift) and er_lift >= 0.20:
+            tags.append("互动增强")
+        if not np.isnan(deep_lift) and deep_lift >= 0.10:
+            tags.append("沉淀提升")
+        if not tags:
+            tags.append("常规")
+
+        if np.isnan(view_lift) or np.isnan(er_lift):
+            quadrant = "无法判断"
+        elif view_lift >= 0 and er_lift >= 0:
+            quadrant = "高播放+高互动"
+        elif view_lift >= 0 and er_lift < 0:
+            quadrant = "高播放+低互动"
+        elif view_lift < 0 and er_lift >= 0:
+            quadrant = "低播放+高互动"
+        else:
+            quadrant = "低播放+低互动"
 
         rows.append({
             "owner_mid": mid,
             "KOL/UP主": up_name,
-            "推荐等级": rec,
+            "推荐等级": grade,
             "综合评分": score,
             "标注": mark,
             "合作视频数": int(len(g_collab)),
             "基准样本数": int(len(base_pool)),
             "基准类型": base_type,
             "基准可靠性": reliability,
+            "象限": quadrant,
             "标签": "、".join(tags),
-            "KOL画像一句话": persona,
+            "KOL画像一句话": f"{'热度拉升' if '热度拉升' in tags else '热度稳定'} + {'互动增强' if '互动增强' in tags else '互动常规'} + {'沉淀提升' if '沉淀提升' in tags else '沉淀一般'}",
             "合作播放中位数": int(collab_view) if not np.isnan(collab_view) else 0,
             "基准播放中位数": int(base_view) if not np.isnan(base_view) else 0,
             "播放提升值": view_lift,
@@ -1834,96 +1718,122 @@ def _build_kol_compare_lib(
         return pd.DataFrame()
     out = pd.DataFrame(rows)
     out["推荐等级"] = pd.Categorical(out["推荐等级"], categories=KOL_GRADE_ORDER, ordered=True)
-    return out.sort_values(["推荐等级", "综合评分"], ascending=[True, False]).reset_index(drop=True)
+    return out.sort_values(["推荐等级", "综合评分"], ascending=[True, False])
+
+
+def _cap_lift_for_plot(x, lo=-1.0, hi=3.0):
+    x = _safe_float(x)
+    if np.isnan(x):
+        return np.nan
+    return float(np.clip(x, lo, hi))
+
+
+def _render_grade_cards(d: pd.DataFrame):
+    counts = d["推荐等级"].astype(str).value_counts().to_dict()
+    cols = st.columns(5)
+    for col, grade in zip(cols, KOL_GRADE_ORDER):
+        col.metric(grade, int(counts.get(grade, 0)))
+        col.caption(KOL_GRADE_DESC[grade])
 
 
 def _render_kol_visuals(lib: pd.DataFrame):
-    """KOL视觉总览：颜色只代表推荐等级；基准可靠性用符号/悬浮说明，避免颜色混淆。"""
     if lib is None or lib.empty:
         st.info("暂无KOL结果可视化。")
         return
     d = lib.copy()
+    d["推荐等级"] = d["推荐等级"].astype(str)
     for c in ["播放提升值", "互动率提升值", "深度信号提升值", "综合评分", "合作播放中位数"]:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
-    d["推荐等级"] = d["推荐等级"].astype(str)
+
+    st.markdown("**统一分级口径（所有图表只使用这一套 ABCDE 颜色）**")
+    _render_grade_cards(d)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("KOL总数", f"{len(d):,}")
-    c2.metric("A重点续约", f"{int((d['推荐等级'] == 'A 重点续约').sum()):,}")
-    c3.metric("B可继续", f"{int((d['推荐等级'] == 'B 可继续').sum()):,}")
-    c4.metric("C/D观察或收缩", f"{int(d['推荐等级'].isin(['C 待观察','D 谨慎投放']).sum()):,}")
+    c2.metric("A/B可继续", f"{int(d['推荐等级'].isin(['A 重点续约', 'B 可继续']).sum()):,}")
+    c3.metric("C待观察", f"{int((d['推荐等级'] == 'C 待观察').sum()):,}")
+    c4.metric("D/E谨慎或无法判断", f"{int(d['推荐等级'].isin(['D 谨慎投放', 'E 无法判断']).sum()):,}")
 
-    st.markdown("**KOL投放四象限（颜色=推荐等级；符号=基准可靠性；只标注重点/异常账号）**")
+    st.markdown("**投放四象限：散点只看分布，名单看下方象限卡片**")
     plot_df = d.dropna(subset=["播放提升值", "互动率提升值"]).copy()
-    if plot_df.empty:
-        st.info("当前KOL缺少可绘制的提升值。")
-    else:
-        plot_df["播放提升显示"] = plot_df["播放提升值"].clip(-1.0, 3.0)
-        plot_df["互动率提升显示"] = plot_df["互动率提升值"].clip(-1.0, 2.0)
-        plot_df["气泡播放"] = np.log10(plot_df["合作播放中位数"].clip(lower=1))
-        plot_df["基准可靠性简写"] = plot_df["基准可靠性"].astype(str).str.extract(r"^(高|中|低|无)", expand=False).fillna("无")
-        plot_df = plot_df.sort_values("综合评分", ascending=False).reset_index(drop=True)
-        # 只标注：A、D、播放体量Top、提升异常Top，最多 12 个，避免挤成一团。
-        label_idx = set(plot_df[plot_df["推荐等级"].isin(["A 重点续约", "D 谨慎投放"])].index.tolist())
-        label_idx.update(plot_df.nlargest(min(5, len(plot_df)), "合作播放中位数").index.tolist())
-        label_idx.update(plot_df.assign(_dist=(plot_df["播放提升显示"].abs() + plot_df["互动率提升显示"].abs())).nlargest(min(5, len(plot_df)), "_dist").index.tolist())
-        label_idx = set(list(label_idx)[:12])
-        plot_df["显示标签"] = [name if i in label_idx else "" for i, name in enumerate(plot_df["KOL/UP主"].astype(str).tolist())]
+    if not plot_df.empty:
+        plot_df["播放提升显示值"] = plot_df["播放提升值"].apply(lambda x: _cap_lift_for_plot(x, -1, 3))
+        plot_df["互动率提升显示值"] = plot_df["互动率提升值"].apply(lambda x: _cap_lift_for_plot(x, -1, 2))
+        plot_df["气泡大小"] = np.log1p(plot_df["合作播放中位数"].clip(lower=0))
+        plot_df["关键标注"] = ""
+        key_idx = set(plot_df.sort_values("综合评分", ascending=False).head(4).index.tolist())
+        key_idx.update(plot_df[plot_df["推荐等级"].isin(["A 重点续约", "D 谨慎投放"])].sort_values("综合评分", ascending=False).head(4).index.tolist())
+        for idx in list(key_idx)[:8]:
+            if idx in plot_df.index:
+                plot_df.loc[idx, "关键标注"] = plot_df.loc[idx, "KOL/UP主"]
 
         fig = px.scatter(
             plot_df,
-            x="播放提升显示",
-            y="互动率提升显示",
-            size="气泡播放",
+            x="播放提升显示值",
+            y="互动率提升显示值",
+            size="气泡大小",
             color="推荐等级",
-            symbol="基准可靠性简写",
-            text="显示标签",
             color_discrete_map=KOL_GRADE_COLORS,
-            category_orders={"推荐等级": KOL_GRADE_ORDER, "基准可靠性简写": ["高", "中", "低", "无"]},
+            category_orders={"推荐等级": KOL_GRADE_ORDER},
+            text="关键标注",
             hover_name="KOL/UP主",
             hover_data={
-                "播放提升显示": False,
-                "互动率提升显示": False,
+                "推荐等级": True,
+                "综合评分": ':.1f',
+                "基准类型": True,
+                "基准可靠性": True,
                 "播放提升": True,
                 "互动率提升": True,
                 "深度信号提升": True,
-                "综合评分": ":.1f",
-                "推荐等级": True,
-                "基准可靠性": True,
-                "基准类型": True,
-                "合作播放中位数": ":,",
-                "基准播放中位数": ":,",
-                "气泡播放": False,
-                "显示标签": False,
+                "合作播放中位数": True,
+                "播放提升显示值": False,
+                "互动率提升显示值": False,
+                "气泡大小": False,
+                "关键标注": False,
             },
-            height=660,
+            height=620,
         )
         fig.add_vline(x=0, line_dash="dash", line_color="black")
         fig.add_hline(y=0, line_dash="dash", line_color="black")
-        fig.add_vrect(x0=0, x1=3, y0=0, y1=2, fillcolor="#2ca02c", opacity=0.06, line_width=0)
-        fig.add_annotation(x=2.65, y=1.75, text="高播放 + 高互动<br>优先续投", showarrow=False, font=dict(size=13))
-        fig.add_annotation(x=2.65, y=-0.78, text="有播放但互动弱<br>谨慎放量", showarrow=False, font=dict(size=13))
-        fig.add_annotation(x=-0.82, y=1.72, text="互动好但播放弱<br>看素材匹配", showarrow=False, font=dict(size=13))
-        fig.add_annotation(x=-0.82, y=-0.78, text="播放/互动双弱<br>减少投放", showarrow=False, font=dict(size=13))
-        fig.update_traces(textposition="top center", marker=dict(opacity=0.82, line=dict(width=1, color="white")))
+        fig.add_vrect(x0=0, x1=3, y0=0, y1=2, fillcolor="#009E73", opacity=0.06, line_width=0)
+        fig.update_traces(textposition="top center", marker=dict(opacity=0.78, line=dict(width=1, color="white")))
         fig.update_layout(
-            xaxis_title="播放提升（显示截断：-100% ~ +300%，真实值看悬浮）",
-            yaxis_title="互动率提升（显示截断：-100% ~ +200%，真实值看悬浮）",
+            xaxis_title="播放提升（显示截断：-100% ~ +300%；真实值见悬浮）",
+            yaxis_title="互动率提升（显示截断：-100% ~ +200%；真实值见悬浮）",
             xaxis_tickformat=".0%",
             yaxis_tickformat=".0%",
-            legend_title_text="推荐等级 / 基准可靠性",
+            legend_title_text="推荐等级",
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("颜色只代表推荐等级：A绿、B蓝、C橙、D红、E灰；基准可靠性只用点形区分，不再参与颜色编码。")
+        st.caption("颜色只代表推荐等级；基准可靠性仅在悬浮与表格中展示，不参与颜色/图例。")
 
-    st.markdown("**KOL综合评分排行（0-100分；颜色与推荐等级完全一致）**")
-    top_rank = d.dropna(subset=["综合评分"]).sort_values("综合评分", ascending=False).head(25).copy()
-    if top_rank.empty:
+    st.markdown("**四象限名单（用于汇报理解，不靠散点标签硬挤）**")
+    quad_order = [
+        ("高播放+高互动", "优先续投/放量"),
+        ("高播放+低互动", "有曝光但质量弱，谨慎放量"),
+        ("低播放+高互动", "素材或投放匹配可复盘"),
+        ("低播放+低互动", "减少投放或重做素材"),
+    ]
+    cols = st.columns(4)
+    for col, (quad, hint) in zip(cols, quad_order):
+        sub = d[d["象限"] == quad].sort_values("综合评分", ascending=False).head(10)
+        col.markdown(f"**{quad}**")
+        col.caption(hint)
+        col.metric("数量", int((d["象限"] == quad).sum()))
+        if sub.empty:
+            col.write("—")
+        else:
+            lines = [f"{r['KOL/UP主']}｜{r['推荐等级'][0]}｜{_safe_float(r['综合评分'], 0):.1f}" for _, r in sub.iterrows()]
+            col.write("\n".join([f"- {x}" for x in lines]))
+
+    st.markdown("**KOL综合评分排行（0-100分；颜色=ABCDE推荐等级）**")
+    rank = d.dropna(subset=["综合评分"]).sort_values("综合评分", ascending=False).head(30).copy()
+    if rank.empty:
         st.info("暂无可排名KOL。")
     else:
         fig_rank = px.bar(
-            top_rank.sort_values("综合评分", ascending=True),
+            rank.sort_values("综合评分", ascending=True),
             x="综合评分",
             y="KOL/UP主",
             orientation="h",
@@ -1931,19 +1841,20 @@ def _render_kol_visuals(lib: pd.DataFrame):
             color_discrete_map=KOL_GRADE_COLORS,
             category_orders={"推荐等级": KOL_GRADE_ORDER},
             text="综合评分",
-            hover_data=["基准可靠性", "播放提升", "互动率提升", "深度信号提升", "合作播放中位数", "基准播放中位数"],
-            height=max(440, min(820, 30 * len(top_rank) + 160)),
+            hover_data=["基准类型", "基准可靠性", "播放提升", "互动率提升", "深度信号提升", "象限"],
+            height=max(520, min(920, 28 * len(rank) + 160)),
         )
         fig_rank.update_traces(texttemplate="%{text:.1f}", textposition="outside")
         fig_rank.update_layout(xaxis_range=[0, 105], legend_title_text="推荐等级", yaxis_title="KOL/UP主")
         st.plotly_chart(fig_rank, use_container_width=True)
 
-    st.markdown("**投放建议分层（汇报摘要）**")
-    cols = st.columns(4)
-    for col, grade, title in zip(cols, KOL_GRADE_ORDER[:4], ["A 重点续约", "B 可继续", "C 待观察", "D 谨慎投放"]):
+    st.markdown("**投放建议分层（统一ABCDE）**")
+    cols = st.columns(5)
+    for col, grade in zip(cols, KOL_GRADE_ORDER):
         names = d[d["推荐等级"] == grade].sort_values("综合评分", ascending=False)["KOL/UP主"].head(8).tolist()
-        col.markdown(f"**{title}**")
-        col.write("、".join(names) if names else "暂无")
+        col.markdown(f"**{grade}**")
+        col.caption(KOL_GRADE_DESC[grade])
+        col.write("\n".join([f"- {x}" for x in names]) if names else "—")
 
 # =========================================================
 # KOL module（按 owner_mid，对齐+补齐+标注+导出）
@@ -1965,9 +1876,9 @@ with st.expander("KOL模块设置", expanded=False):
         help="如遇接口返回空或风控，可临时粘贴浏览器 Cookie；不要把 Cookie 写进代码或上传到公共仓库。"
     )
     bili_proxy = st.text_input(
-        "代理地址（可选；本机Clash常见为 http://127.0.0.1:7890，Streamlit Cloud通常留空）",
+        "代理地址（可选；本地Clash常见 http://127.0.0.1:7890，云端部署通常留空）",
         value=os.environ.get("BILI_PROXY", ""),
-        help="浏览器开VPN不等于Streamlit/Python请求也走VPN；本地运行时可填代理地址，云端部署通常不能使用你本机代理。"
+        help="浏览器开VPN不等于 Python requests 也走VPN；本地运行时可填代理地址。"
     )
 
 cA, cB, cC = st.columns([1, 1, 2])
@@ -1976,7 +1887,7 @@ with cA:
 with cB:
     btn_build_kol = st.button("📚 生成KOL对比表（含视觉总览）")
 with cC:
-    st.caption("抓取链路：先修复合作BV owner_mid，再聚合 Web WBI / 老接口 / APP cursor / 合集 / 动态 / 昵称搜索 / HTML / Selenium。颜色口径：A绿、B蓝、C橙、D红、E灰。")
+    st.caption("本版关键：抓取链路完整跑完；视觉层统一 ABCDE 分级与颜色。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
@@ -1998,30 +1909,22 @@ if collab_projects:
             st.dataframe(bad_rows[["project","bvid","title","owner_name","owner_mid"]].head(80), use_container_width=True, height=220)
         else:
             st.success("合作视频 owner_mid 看起来正常。")
-        if st.session_state.get("kol_last_debug"):
-            with st.expander("上次KOL抓取诊断日志（用于定位到底卡在哪个接口）", expanded=False):
-                dbg_prev = pd.DataFrame(st.session_state.get("kol_last_debug", []))
-                if not dbg_prev.empty:
-                    st.dataframe(dbg_prev, use_container_width=True, height=300)
-                    fail_prev = dbg_prev[dbg_prev["ok"].astype(str).isin(["False", "false", "0"])] if "ok" in dbg_prev.columns else pd.DataFrame()
-                    if not fail_prev.empty and "source" in fail_prev.columns:
-                        st.write("失败/空结果来源统计：")
-                        st.dataframe(fail_prev.groupby(["source", "code"]).size().reset_index(name="次数").sort_values("次数", ascending=False), use_container_width=True, height=220)
 
     name_map = (valid_mid_df.groupby("owner_mid")["owner_name"]
                 .agg(lambda s: s.value_counts().index[0]).to_dict()) if not valid_mid_df.empty else {}
 
     if btn_fill_all:
         progress = st.progress(0)
-        status_box = st.empty()
+        status = st.empty()
         debug_rows = []
         rows_to_write = {}
         stat = {
             "collab_repair_total": 0, "collab_repair_ok": 0, "collab_repair_fail": 0,
             "list_fail": 0, "list_empty": 0, "detail_ok": 0, "detail_fail": 0, "vlist_added": 0,
+            "collab_refresh_total": 0, "collab_refresh_ok": 0, "collab_refresh_fail": 0
         }
 
-        # A0. 先刷新合作BV详情，修复 CSV 导入缺 owner_mid 的根因
+        # ========= A0) 先刷新合作BV详情：修复 CSV 导入缺 owner_mid 的根因 =========
         collab_pairs_all = (df_db[(df_db["project"].isin(collab_projects)) & (df_db["project"] != BASELINE_PROJECT)]
                             [["project","bvid","url"]]
                             .dropna(subset=["project","bvid"])
@@ -2036,37 +1939,41 @@ if collab_projects:
         for proj, bvid, url in collab_pairs_all:
             step += 1
             progress.progress(min(1.0, step / total_steps))
-            status_box.info(f"正在刷新合作BV详情/修复 owner_mid：{bvid}")
+            status.info(f"正在刷新合作BV详情/修复 owner_mid：{bvid}")
             bvid = str(bvid)
             if not bvid.startswith("BV"):
                 stat["collab_repair_fail"] += 1
                 continue
+
             detail = fetch_video_detail_by_bvid(bvid, sess=detail_sess)
             if detail is None:
                 stat["collab_repair_fail"] += 1
-                debug_rows.append({"owner_mid": "", "KOL/UP主": "", "source": "collab_detail_repair", "ok": False, "count": 0, "code": "DETAIL_FAIL", "message": bvid, "time": pd.Timestamp.now().strftime("%H:%M:%S")})
                 _sleep_jitter(float(sleep_sec))
                 continue
-            detail_row = _detail_row_for_project(detail, project=str(proj), url=_safe_str(url), data_type="collab", baseline_for="")
-            rows_to_write[(str(proj), bvid)] = detail_row
+
+            row = _detail_row_for_project(detail, project=str(proj), url=url, data_type="collab", baseline_for="")
+            rows_to_write[(row["project"], row["bvid"])] = row
             stat["collab_repair_ok"] += 1
             _sleep_jitter(float(sleep_sec))
 
-        df_db_work = df_db.copy()
         if rows_to_write:
-            df_rep = normalize_df(pd.DataFrame(list(rows_to_write.values())))
-            df_rep["pubdate"] = pd.to_datetime(df_rep["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-            df_rep["fetched_at"] = pd.to_datetime(df_rep["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-            upsert_rows(df_rep)
-            df_db_work = normalize_df(load_all_rows())
+            df_repair = normalize_df(pd.DataFrame(list(rows_to_write.values())))
+            df_repair["pubdate"] = pd.to_datetime(df_repair["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            df_repair["fetched_at"] = pd.to_datetime(df_repair["fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            upsert_rows(df_repair)
+            df_db_work = compute_metrics(normalize_df(load_all_rows()))
+        else:
+            df_db_work = df_db.copy()
 
-        # A1. 用修复后的 owner_mid 重新抓个人基准
+        # 用修复后的 owner_mid 重新计算合作KOL
         collab_df_work = df_db_work[df_db_work["project"].isin(collab_projects)].copy()
         collab_df_work["owner_mid"] = collab_df_work["owner_mid"].apply(_norm_mid)
         valid_mid_df_work = collab_df_work[collab_df_work["owner_mid"].astype(str).str.len() > 0].copy()
         name_map_work = (valid_mid_df_work.groupby("owner_mid")["owner_name"]
                          .agg(lambda s: s.value_counts().index[0]).to_dict()) if not valid_mid_df_work.empty else {}
-        collab_bvids_all = set(valid_mid_df_work["bvid"].astype(str).tolist())
+
+        # ========= A1) 补齐 baseline =========
+        existed_baseline = set(df_db_work[df_db_work["project"] == BASELINE_PROJECT]["bvid"].astype(str).tolist())
         baseline_rows_to_write = {}
 
         mids = sorted(valid_mid_df_work["owner_mid"].unique().tolist())
@@ -2077,7 +1984,7 @@ if collab_projects:
                 step += 1
                 progress.progress(min(1.0, step / total_steps))
                 disp = name_map_work.get(mid, "")
-                status_box.info(f"正在抓取KOL基准：{disp or mid}（mid={mid}）")
+                status.info(f"正在抓取KOL基准：{disp or mid}（mid={mid}）")
                 per_mid_debug = []
                 try:
                     vlist = fetch_vlist_by_mid(
@@ -2103,44 +2010,56 @@ if collab_projects:
                     stat["list_empty"] += 1
                     continue
 
+                collab_bvids_all = set(valid_mid_df_work["bvid"].astype(str).tolist())
                 for v in vlist:
                     bvid = v.get("bvid", "")
                     if not bvid or bvid in collab_bvids_all:
                         continue
+
                     base_row = {
                         "project": BASELINE_PROJECT,
                         "bvid": bvid,
                         "url": f"https://www.bilibili.com/video/{bvid}",
-                        "title": v.get("title", ""),
+                        "title": v.get("title",""),
                         "pubdate": v.get("pubdate", pd.NaT),
                         "owner_mid": mid,
                         "owner_name": disp,
-                        "view": _safe_int(v.get("view", 0)),
-                        "reply": _safe_int(v.get("reply", 0)),
-                        "like": _safe_int(v.get("like", 0)),
-                        "coin": _safe_int(v.get("coin", 0)),
-                        "favorite": _safe_int(v.get("favorite", 0)),
-                        "danmaku": _safe_int(v.get("danmaku", 0)),
-                        "share": _safe_int(v.get("share", 0)),
+                        "view": _safe_int(v.get("view",0)),
+                        "reply": _safe_int(v.get("reply",0)),
+                        "like": _safe_int(v.get("like",0)),
+                        "coin": _safe_int(v.get("coin",0)),
+                        "favorite": _safe_int(v.get("favorite",0)),
+                        "danmaku": _safe_int(v.get("danmaku",0)),
+                        "share": _safe_int(v.get("share",0)),
                         "fans_delta": 0,
                         "baseline_for": disp,
                         "data_type": "baseline",
                         "fetched_at": pd.Timestamp.now(),
                     }
                     baseline_rows_to_write[(BASELINE_PROJECT, bvid)] = base_row
+                    existed_baseline.add(bvid)
                     stat["vlist_added"] += 1
 
-                    detail = fetch_video_detail_by_bvid(bvid, sess=detail_sess)
+                    detail = fetch_video_detail_by_bvid(bvid, sess=detail_sess, cookie=bili_cookie, proxy=bili_proxy)
                     if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
-                        detail_row = _detail_row_for_project(detail, project=BASELINE_PROJECT, url=f"https://www.bilibili.com/video/{bvid}", data_type="baseline", baseline_for=disp)
+                        detail_row = _detail_row_for_project(
+                            detail,
+                            project=BASELINE_PROJECT,
+                            url=f"https://www.bilibili.com/video/{bvid}",
+                            data_type="baseline",
+                            baseline_for=disp,
+                        )
+                        # 详情接口的 owner_name 更准，但如果详情没有昵称，则保留合作库昵称
                         if not detail_row.get("owner_name"):
                             detail_row["owner_name"] = disp
                         baseline_rows_to_write[(BASELINE_PROJECT, bvid)] = detail_row
                         stat["detail_ok"] += 1
                     else:
                         stat["detail_fail"] += 1
+
                     _sleep_jitter(float(sleep_sec))
 
+        # ========= A2) 写入 baseline =========
         if baseline_rows_to_write:
             df_new = normalize_df(pd.DataFrame(list(baseline_rows_to_write.values())))
             df_new["pubdate"] = pd.to_datetime(df_new["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -2148,51 +2067,46 @@ if collab_projects:
             upsert_rows(df_new)
 
         progress.progress(1.0)
-        status_box.success("KOL补齐流程完成。")
-        st.session_state["kol_last_debug"] = debug_rows
+        status.success("KOL补齐流程完成。")
 
         if debug_rows and show_kol_quality_hint:
             with st.expander("本次KOL抓取诊断日志", expanded=True):
                 dbg = pd.DataFrame(debug_rows)
                 st.dataframe(dbg, use_container_width=True, height=320)
-                fail_dbg = dbg[dbg["ok"] == False] if "ok" in dbg.columns else pd.DataFrame()
-                if not fail_dbg.empty:
-                    st.write("失败/空结果来源统计：")
-                    st.dataframe(fail_dbg.groupby(["source", "code"]).size().reset_index(name="次数").sort_values("次数", ascending=False), use_container_width=True, height=220)
 
         if baseline_rows_to_write or rows_to_write:
             st.success(
                 f"完成：合作BV详情刷新 {stat['collab_repair_ok']}/{stat['collab_repair_total']}；"
-                f"新增/覆盖 {stat['vlist_added']} 条基准；"
+                f"新增 {stat['vlist_added']} 条基准；"
                 f"列表失败 {stat['list_fail']}，列表空 {stat['list_empty']}；"
                 f"详情补全成功 {stat['detail_ok']}，失败 {stat['detail_fail']}。"
                 f"（数据已自动备份到 backup/backup_latest.csv）"
             )
             st.rerun()
         else:
-            st.warning("本次未写入任何数据：合作BV详情、KOL列表、基准详情都未成功。请展开诊断日志看具体接口返回；必要时填写 B站 Cookie 或改用本地运行+代理。")
+            st.warning("本次未写入任何数据：合作BV详情、KOL列表、基准详情都未成功。请打开诊断日志看具体接口返回，必要时填入 B站 Cookie 后重试。")
 
     st.markdown("**KOL基准诊断（按owner_mid统计库内数量）**")
     diag = []
     for mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
         owner_all = df_db[df_db["owner_mid"].apply(_norm_mid) == mid].copy()
         owner_all = _sort_owner_hist(owner_all)
-        collab_bvids = set(collab_df[collab_df["owner_mid"] == mid]["bvid"].astype(str).tolist())
-        base_pool = owner_all[(~owner_all["project"].isin(set(collab_projects))) | (owner_all["project"] == BASELINE_PROJECT)].copy()
-        base_pool = base_pool[~base_pool["bvid"].astype(str).isin(collab_bvids)]
-        base_pool = base_pool[base_pool["view"].astype(float) > 0]
+
+        base_pool = owner_all[~owner_all["project"].isin(set(collab_projects))].copy()
+        base_pool = pd.concat([base_pool, owner_all[owner_all["project"] == BASELINE_PROJECT]], ignore_index=True)
         base_pool = base_pool.drop_duplicates(subset=["bvid"], keep="last")
         base_pool = _sort_owner_hist(base_pool)
+
         avail = int(min(len(base_pool), baseline_window_n))
         if avail >= baseline_min_n:
             status_text = "OK"
-            advice = "个人历史足量，可直接比较"
+            advice = "个人历史足量"
         elif avail > 0:
             status_text = f"小样本({avail}/{baseline_min_n})"
-            advice = "可参考，但建议继续补齐"
+            advice = "可参考，建议继续补齐"
         else:
             status_text = "无个人历史基准"
-            advice = "将继续尝试多接口；生成表可使用平台替代基准"
+            advice = "会继续多接口尝试；生成表可用平台替代基准"
         diag.append({
             "owner_mid": mid,
             "KOL/UP主": name_map.get(mid, owner_all["owner_name"].dropna().iloc[0] if not owner_all.empty else ""),
@@ -2205,9 +2119,6 @@ if collab_projects:
     if diag:
         diag_df = pd.DataFrame(diag).sort_values(["状态", "可用个人基准数"], ascending=[True, False])
         st.dataframe(diag_df, use_container_width=True, height=360)
-        no_base_cnt = int((diag_df["可用个人基准数"] == 0).sum())
-        if no_base_cnt > 0:
-            st.info(f"还有 {no_base_cnt} 个KOL没有个人历史基准。通常卡在：UP隐藏投稿/公开视频很少、空间接口风控、搜索召回不到该mid。生成表时会用‘平台替代基准’并在表中明确标注，不会伪装成个人历史基准。")
     else:
         st.info("暂无可诊断的 owner_mid。点击“一键补齐”会先尝试用合作BV详情修复 owner_mid。")
 
@@ -2229,7 +2140,7 @@ if collab_projects:
                 _render_kol_visuals(lib)
             with tab_table:
                 display_cols = [
-                    "owner_mid", "KOL/UP主", "推荐等级", "综合评分", "标注", "合作视频数", "基准样本数", "基准类型", "基准可靠性",
+                    "owner_mid", "KOL/UP主", "推荐等级", "综合评分", "标注", "合作视频数", "基准样本数", "基准类型", "基准可靠性", "象限",
                     "标签", "KOL画像一句话", "合作播放中位数", "基准播放中位数", "播放提升",
                     "合作互动率中位数", "基准互动率中位数", "互动率提升",
                     "合作深度信号中位数", "基准深度信号中位数", "深度信号提升"
@@ -2237,12 +2148,13 @@ if collab_projects:
                 show_lib = lib.copy()
                 if "综合评分" in show_lib.columns:
                     show_lib["综合评分"] = pd.to_numeric(show_lib["综合评分"], errors="coerce").round(1)
-                st.dataframe(show_lib[[c for c in display_cols if c in show_lib.columns]], use_container_width=True, height=520)
+                st.dataframe(show_lib[[c for c in display_cols if c in show_lib.columns]], use_container_width=True, height=560)
                 st.download_button(
                     "⬇️ 下载KOL对比表（CSV）",
                     data=show_lib.to_csv(index=False).encode("utf-8-sig"),
                     file_name="kol_compare.csv",
                     mime="text/csv"
                 )
+
 else:
     st.info("请先在 KOL模块设置 中选择合作项目。")
