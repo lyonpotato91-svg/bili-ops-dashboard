@@ -1318,35 +1318,85 @@ def _clip_score(x, lo=-1.0, hi=2.0) -> float:
         return 0.0
 
 
-def _recommendation(view_lift: float, er_lift: float, deep_lift: float, base_type: str, sample_n: int, min_n: int) -> tuple[str, float]:
-    raw_score = 100 * (
-        0.55 * _clip_score(view_lift) +
-        0.30 * _clip_score(er_lift) +
-        0.15 * _clip_score(deep_lift)
-    )
-    if base_type == "平台替代基准":
-        raw_score *= 0.55
-    elif sample_n < min_n:
-        raw_score *= 0.75
 
+def _score_component(lift: float, neutral: float = 50.0, pos_cap: float = 1.5, neg_cap: float = -0.8) -> float:
+    """
+    把提升率转换成 0-100 分。
+    0% 提升 = 50 分；明显负向会降分；极端正向会封顶，避免一个爆量样本把综合分拉穿。
+    """
+    try:
+        if lift is None or np.isnan(float(lift)):
+            return neutral
+        x = float(lift)
+        if x >= 0:
+            return float(neutral + (100.0 - neutral) * min(x, pos_cap) / pos_cap)
+        return float(neutral * (1.0 - min(abs(x), abs(neg_cap)) / abs(neg_cap)))
+    except Exception:
+        return neutral
+
+
+def _recommendation(view_lift: float, er_lift: float, deep_lift: float, base_type: str, sample_n: int, min_n: int) -> tuple[str, float]:
+    """
+    KOL 推荐等级和综合评分。
+
+    关键原则：
+    1）综合评分固定为 0-100，越高越适合继续投入；
+    2）推荐等级必须和评分一致，不能出现“高分却 D 谨慎投放”；
+    3）平台替代基准/小样本会降低置信度，不直接判 A；
+    4）播放爆量但互动率明显下滑，会被限分，避免“只有量、无质量”的账号被误判为强推荐。
+    """
     if base_type == "无基准":
         return "E 无法判断", np.nan
-    if base_type == "平台替代基准":
-        if raw_score >= 12:
-            return "B 可继续验证", raw_score
-        if raw_score <= -12:
-            return "D 谨慎投放", raw_score
-        return "C 待观察", raw_score
-    if (not np.isnan(view_lift) and view_lift <= -0.35) or (not np.isnan(er_lift) and er_lift <= -0.25):
-        return "D 谨慎投放", raw_score
-    if raw_score >= 25:
-        return "A 重点续约", raw_score
-    if raw_score >= 5:
-        return "B 可继续", raw_score
-    if raw_score <= -12:
-        return "D 谨慎投放", raw_score
-    return "C 待观察", raw_score
 
+    view_score = _score_component(view_lift, pos_cap=1.5, neg_cap=-0.8)
+    er_score = _score_component(er_lift, pos_cap=1.0, neg_cap=-0.6)
+    deep_score = _score_component(deep_lift, pos_cap=1.0, neg_cap=-0.6)
+
+    score = 0.45 * view_score + 0.40 * er_score + 0.15 * deep_score
+
+    # 置信度折扣：不是 KOL 自身足量历史时，分数向 50 的中性位置收缩。
+    if base_type == "平台替代基准":
+        score = 50.0 + (score - 50.0) * 0.68
+    elif sample_n < min_n:
+        score = 50.0 + (score - 50.0) * 0.82
+
+    # 质量红线：播放有增长但互动/沉淀显著下滑时，不能给高续投分。
+    try:
+        if not np.isnan(float(er_lift)) and float(er_lift) <= -0.45:
+            score = min(score, 48.0)
+        elif not np.isnan(float(er_lift)) and float(er_lift) <= -0.25:
+            score = min(score, 58.0)
+        if not np.isnan(float(view_lift)) and float(view_lift) <= -0.50:
+            score = min(score, 45.0)
+        if not np.isnan(float(deep_lift)) and float(deep_lift) <= -0.50:
+            score = min(score, 60.0)
+    except Exception:
+        pass
+
+    score = float(np.clip(score, 0.0, 100.0))
+
+    # 按分数分层，保证图例/颜色与“越高越适合继续投入”一致。
+    if score >= 75:
+        rec = "A 重点续约"
+    elif score >= 60:
+        rec = "B 可继续"
+    elif score >= 45:
+        rec = "C 待观察"
+    else:
+        rec = "D 谨慎投放"
+
+    # 替代基准和小样本不直接给 A，避免汇报时误读为强结论。
+    if base_type == "平台替代基准":
+        if score >= 60:
+            rec = "B 可继续验证"
+        elif score >= 45:
+            rec = "C 待观察"
+        else:
+            rec = "D 谨慎投放"
+    elif base_type == "KOL历史小样本" and rec.startswith("A"):
+        rec = "B 可继续验证"
+
+    return rec, score
 
 def _build_kol_compare_lib(
     df_all_m: pd.DataFrame,
@@ -1475,6 +1525,16 @@ def _build_kol_compare_lib(
     return pd.DataFrame(rows).sort_values(["推荐等级", "综合评分"], ascending=[True, False])
 
 
+
+def _cap_lift_for_plot(x, lo=-1.0, hi=3.0) -> float:
+    try:
+        if x is None or np.isnan(float(x)):
+            return np.nan
+        return float(np.clip(float(x), lo, hi))
+    except Exception:
+        return np.nan
+
+
 def _render_kol_visuals(lib: pd.DataFrame):
     """KOL视觉总览：汇报时看图，校对时看表。"""
     if lib is None or lib.empty:
@@ -1492,52 +1552,112 @@ def _render_kol_visuals(lib: pd.DataFrame):
     c3.metric("待观察/替代基准", f"{int(d['推荐等级'].astype(str).str.startswith('C').sum() + (d['基准类型'] == '平台替代基准').sum()):,}")
     c4.metric("谨慎投放", f"{int(d['推荐等级'].astype(str).str.startswith('D').sum()):,}")
 
-    st.markdown("**KOL投放四象限（X=播放提升，Y=互动率提升，气泡=合作播放中位数）**")
+    st.markdown("**KOL投放四象限（清爽版：只标重点/异常，全部账号可悬浮查看）**")
     plot_df = d.dropna(subset=["播放提升值", "互动率提升值"]).copy()
     if not plot_df.empty:
+        # 极端爆量账号会把主体挤在 0 附近，因此显示轴做截断；真实提升值仍保留在悬浮信息里。
+        plot_df["播放提升_显示"] = plot_df["播放提升值"].apply(lambda x: _cap_lift_for_plot(x, -1.0, 3.0))
+        plot_df["互动率提升_显示"] = plot_df["互动率提升值"].apply(lambda x: _cap_lift_for_plot(x, -1.0, 2.0))
+        plot_df["显示备注"] = ""
+        plot_df.loc[plot_df["播放提升值"] > 3.0, "显示备注"] += "播放提升>300%；"
+        plot_df.loc[plot_df["互动率提升值"] > 2.0, "显示备注"] += "互动率提升>200%；"
+        plot_df.loc[plot_df["播放提升值"] < -1.0, "显示备注"] += "播放提升<-100%；"
+        plot_df.loc[plot_df["互动率提升值"] < -1.0, "显示备注"] += "互动率提升<-100%；"
+
+        # 气泡面积用 log，避免一个超大账号吞掉其他点。
+        plot_df["气泡大小"] = np.log1p(plot_df["合作播放中位数"].clip(lower=0))
+
+        plot_df["标签显示"] = ""
+        top_label_names = set(
+            pd.concat([
+                plot_df.sort_values("综合评分", ascending=False).head(8)["KOL/UP主"],
+                plot_df[plot_df["推荐等级"].astype(str).str.startswith("A")]["KOL/UP主"].head(12),
+                plot_df.sort_values("合作播放中位数", ascending=False).head(5)["KOL/UP主"],
+            ]).dropna().astype(str).tolist()
+        )
+        plot_df.loc[plot_df["KOL/UP主"].astype(str).isin(top_label_names), "标签显示"] = plot_df["KOL/UP主"]
+
         fig = px.scatter(
             plot_df,
-            x="播放提升值",
-            y="互动率提升值",
-            size="合作播放中位数",
+            x="播放提升_显示",
+            y="互动率提升_显示",
+            size="气泡大小",
+            size_max=30,
             color="推荐等级",
-            text="KOL/UP主",
-            hover_data=["基准类型", "样本状态", "合作视频数", "基准样本数", "播放提升", "互动率提升", "深度信号提升", "综合评分"],
+            text="标签显示",
+            hover_name="KOL/UP主",
+            hover_data={
+                "播放提升_显示": False,
+                "互动率提升_显示": False,
+                "气泡大小": False,
+                "推荐等级": True,
+                "基准类型": True,
+                "样本状态": True,
+                "合作视频数": True,
+                "基准样本数": True,
+                "播放提升": True,
+                "互动率提升": True,
+                "深度信号提升": True,
+                "合作播放中位数": ":,",
+                "综合评分": ":.1f",
+                "显示备注": True,
+            },
+            category_orders={"推荐等级": ["A 重点续约", "B 可继续", "B 可继续验证", "C 待观察", "D 谨慎投放", "E 无法判断"]},
         )
-        fig.add_vline(x=0, line_dash="dash")
-        fig.add_hline(y=0, line_dash="dash")
-        fig.update_traces(textposition="top center")
-        fig.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%", height=560)
+        fig.add_vline(x=0, line_dash="dash", line_color="black")
+        fig.add_hline(y=0, line_dash="dash", line_color="black")
+        fig.add_vrect(x0=0, x1=3.0, fillcolor="LightGreen", opacity=0.08, line_width=0)
+        fig.add_hrect(y0=0, y1=2.0, fillcolor="LightBlue", opacity=0.06, line_width=0)
+        fig.add_annotation(x=2.85, y=1.85, text="高播放 × 高互动<br>优先续投", showarrow=False, font_size=12)
+        fig.add_annotation(x=-0.85, y=1.85, text="互动好但播放弱<br>看素材匹配", showarrow=False, font_size=12)
+        fig.add_annotation(x=2.85, y=-0.85, text="有播放但互动弱<br>谨慎放量", showarrow=False, font_size=12)
+        fig.add_annotation(x=-0.85, y=-0.85, text="播放/互动双弱<br>减少投放", showarrow=False, font_size=12)
+        fig.update_traces(textposition="top center", textfont_size=10)
+        fig.update_layout(
+            xaxis_title="播放提升（显示截断：-100% ~ +300%，真实值看悬浮）",
+            yaxis_title="互动率提升（显示截断：-100% ~ +200%，真实值看悬浮）",
+            xaxis_tickformat=".0%",
+            yaxis_tickformat=".0%",
+            height=620,
+            legend_title_text="推荐等级",
+        )
         st.plotly_chart(fig, use_container_width=True)
+        st.caption("说明：为避免极端爆量账号把所有点挤在一起，四象限显示轴做了截断；真实播放/互动提升在鼠标悬浮中查看。图上只显示重点和异常账号名称，其余账号用悬浮查看。")
     else:
         st.info("可视化需要至少有一项可计算提升值。")
 
     top_rank = d.dropna(subset=["综合评分"]).sort_values("综合评分", ascending=False).head(20).copy()
     if not top_rank.empty:
-        st.markdown("**KOL综合评分排行（越高越适合继续投入）**")
+        st.markdown("**KOL综合评分排行（0-100分，越高越适合继续投入；颜色与推荐等级保持一致）**")
         fig_rank = px.bar(
             top_rank.sort_values("综合评分", ascending=True),
             x="综合评分",
             y="KOL/UP主",
             color="推荐等级",
             orientation="h",
-            hover_data=["基准类型", "播放提升", "互动率提升", "深度信号提升", "合作播放中位数", "基准播放中位数"],
+            hover_data=["基准类型", "样本状态", "播放提升", "互动率提升", "深度信号提升", "合作播放中位数", "基准播放中位数"],
             text="综合评分",
+            category_orders={"推荐等级": ["A 重点续约", "B 可继续", "B 可继续验证", "C 待观察", "D 谨慎投放", "E 无法判断"]},
         )
         fig_rank.update_traces(texttemplate="%{text:.1f}", textposition="outside")
-        fig_rank.update_layout(height=max(420, min(760, 28 * len(top_rank) + 180)))
+        fig_rank.update_xaxes(range=[0, 105])
+        fig_rank.update_layout(height=max(420, min(760, 28 * len(top_rank) + 180)), legend_title_text="推荐等级")
         st.plotly_chart(fig_rank, use_container_width=True)
+        st.caption("评分口径：播放、互动率、深度信号综合加权；播放爆量但互动率明显下滑会被限分，避免“高曝光低质量”被误判为强推荐。")
 
     st.markdown("**投放建议分层**")
     cols = st.columns(4)
     buckets = [
         ("A 重点续约", "继续投/加预算"),
-        ("B 可继续", "稳定合作"),
+        ("B 可继续", "稳定合作或继续验证"),
         ("C 待观察", "小额测试/看素材"),
         ("D 谨慎投放", "复盘后再投"),
     ]
     for col, (prefix, subtitle) in zip(cols, buckets):
-        names = d[d["推荐等级"].astype(str).str.startswith(prefix.split()[0])]["KOL/UP主"].head(8).tolist()
+        if prefix.startswith("B"):
+            names = d[d["推荐等级"].astype(str).str.startswith("B")].sort_values("综合评分", ascending=False)["KOL/UP主"].head(8).tolist()
+        else:
+            names = d[d["推荐等级"].astype(str).str.startswith(prefix.split()[0])].sort_values("综合评分", ascending=False)["KOL/UP主"].head(8).tolist()
         col.markdown(f"**{prefix}**")
         col.caption(subtitle)
         col.write("\n".join([f"- {x}" for x in names]) if names else "—")
