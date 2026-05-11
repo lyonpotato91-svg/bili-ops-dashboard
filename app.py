@@ -869,6 +869,231 @@ def _fetch_vlist_by_mid_app_cursor(mid: int, n: int, sess: requests.Session, sle
     return []
 
 
+
+def _extract_bvids_from_any(obj, limit: int = 80) -> list[str]:
+    """递归从任意 JSON/HTML 片段里提取 BV，适配动态流和页面内嵌数据。"""
+    seen, out = set(), []
+
+    def add_from_text(s: str):
+        for bv in re.findall(r"BV[0-9A-Za-z]{10}", s or ""):
+            if bv not in seen:
+                seen.add(bv)
+                out.append(bv)
+                if len(out) >= limit:
+                    return
+
+    def walk(x):
+        if len(out) >= limit:
+            return
+        if isinstance(x, dict):
+            # 常见直出字段优先
+            for key in ["bvid", "bvidStr", "BV", "short_link_v2", "jump_url", "arcurl", "url", "uri"]:
+                if key in x:
+                    add_from_text(_safe_str(x.get(key)))
+                    if len(out) >= limit:
+                        return
+            for v in x.values():
+                walk(v)
+                if len(out) >= limit:
+                    return
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+                if len(out) >= limit:
+                    return
+        elif isinstance(x, str):
+            # 动态接口里 card 有时是 JSON 字符串
+            add_from_text(x)
+            if (x.startswith("{") or x.startswith("[")) and len(x) < 800000:
+                try:
+                    walk(json.loads(x))
+                except Exception:
+                    pass
+
+    walk(obj)
+    return out[:limit]
+
+
+def _detail_rows_from_bvids(
+    bvids: list[str],
+    mid: int,
+    n: int,
+    sess: requests.Session,
+    sleep_sec: float,
+    debug: list | None = None,
+    source: str = "detail_filter",
+) -> list[dict]:
+    """用详情接口补齐并按 owner_mid 严格过滤，避免搜索结果串号。"""
+    rows = []
+    seen = set()
+    target_mid = _norm_mid(mid)
+    for bvid in bvids:
+        if len(rows) >= n:
+            break
+        if not bvid or bvid in seen:
+            continue
+        seen.add(bvid)
+        detail = fetch_video_detail_by_bvid(bvid, sess=sess)
+        if detail is None:
+            _log_kol_debug(debug, source, False, f"detail_fail {bvid}", 0, "DETAIL")
+            _sleep_jitter(sleep_sec)
+            continue
+        owner_mid = _norm_mid(detail.get("owner_mid"))
+        if owner_mid != target_mid:
+            _log_kol_debug(debug, source, False, f"skip_other_owner {bvid} owner_mid={owner_mid}", 0, "FILTER")
+            _sleep_jitter(0.15)
+            continue
+        rows.append({
+            "bvid": bvid,
+            "title": detail.get("title", ""),
+            "pubdate": detail.get("pubdate", pd.NaT),
+            "view": _safe_int(detail.get("view", 0)),
+            "like": _safe_int(detail.get("like", 0)),
+            "coin": _safe_int(detail.get("coin", 0)),
+            "favorite": _safe_int(detail.get("favorite", 0)),
+            "reply": _safe_int(detail.get("reply", 0)),
+            "danmaku": _safe_int(detail.get("danmaku", 0)),
+            "share": _safe_int(detail.get("share", 0)),
+        })
+        _sleep_jitter(sleep_sec)
+    _log_kol_debug(debug, source, bool(rows), f"verified={len(rows)}", len(rows), "OK" if rows else "EMPTY")
+    return _dedupe_rows(rows, n)
+
+
+def _fetch_vlist_by_mid_dynamic(mid: int, n: int, sess: requests.Session, sleep_sec: float, cookie: str = "", debug: list | None = None) -> list[dict]:
+    """
+    动态流兜底：很多UP的投稿会同步到动态；当 space arc/search 空列表时，动态流经常还能拿到 BV。
+    文档提示该接口未登录时依赖 buvid3/WBI/dm_img，登录 Cookie 更稳，所以这里走“能签就签、能带cookie就带”。
+    """
+    apis = [
+        "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+        "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space",
+    ]
+    features = "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,forwardListHidden,decorationCard,commentsNewVersion,onlyfansAssetsV2,ugcDelete,onlyfansQaCard"
+    rows = []
+    for api in apis:
+        offset = ""
+        for page_i in range(1, 7):
+            if len(rows) >= n:
+                break
+            params = {
+                "host_mid": mid,
+                "timezone_offset": -480,
+                "platform": "web",
+                "features": features,
+                "web_location": "333.1387",
+                "dm_img_switch": 0,
+                "dm_img_list": "[]",
+                "dm_img_str": "",
+                "dm_cover_img_str": "",
+                "dm_img_inter": "{\"ds\":[],\"wh\":[0,0,0],\"of\":[0,0,0]}",
+            }
+            if offset:
+                params["offset"] = offset
+            try:
+                try:
+                    params_signed = _wbi_sign(params)
+                except Exception:
+                    params_signed = params
+                r = sess.get(api, params=params_signed, headers={"Referer": f"https://space.bilibili.com/{mid}/dynamic"}, timeout=14)
+                j = r.json()
+                code = j.get("code", -1)
+                data = j.get("data") or {}
+                items = data.get("items") or []
+                bvids = _extract_bvids_from_any(items, limit=max(n * 3, 30))
+                _log_kol_debug(debug, "dynamic_feed", code == 0 and bool(bvids), f"{api.split('/')[5]} page={page_i} bvid={len(bvids)}", len(bvids), code)
+                if code == 0 and bvids:
+                    more = _detail_rows_from_bvids(bvids, mid, n - len(rows), sess, sleep_sec, debug, source="dynamic_detail_filter")
+                    rows = _dedupe_rows(rows + more, n)
+                offset = _safe_str(data.get("offset") or data.get("update_baseline") or "")
+                has_more = bool(data.get("has_more"))
+                if not has_more or not offset:
+                    break
+            except Exception as e:
+                _log_kol_debug(debug, "dynamic_feed", False, f"page={page_i}: {type(e).__name__}: {e}", 0, "EXC")
+                break
+            _sleep_jitter(sleep_sec)
+        rows = _dedupe_rows(rows, n)
+        if len(rows) >= max(1, min(n, 3)):
+            return rows[:n]
+    return _dedupe_rows(rows, n)
+
+
+def _fetch_vlist_by_mid_search(mid: int, owner_name: str, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
+    """
+    全站视频搜索兜底：按昵称检索视频，并通过 result.mid 或详情接口 owner_mid 二次过滤。
+    这个路径用于解决“能从合作BV拿到mid，但空间投稿列表为空”的情况。
+    """
+    owner_name = _safe_str(owner_name).strip()
+    if not owner_name:
+        return []
+    api = "https://api.bilibili.com/x/web-interface/search/type"
+    rows = []
+    seen_bvids = set()
+    # pubdate 最适合做最近基准；totalrank 可补部分搜索排序漏召回。
+    for order in ["pubdate", "totalrank"]:
+        for page in range(1, 8):
+            if len(rows) >= n:
+                break
+            params = {
+                "search_type": "video",
+                "keyword": owner_name,
+                "order": order,
+                "duration": 0,
+                "tids": 0,
+                "page": page,
+            }
+            try:
+                r = sess.get(api, params=params, headers={"Referer": "https://search.bilibili.com/"}, timeout=14)
+                j = r.json()
+                code = j.get("code", -1)
+                data = j.get("data") or {}
+                result = data.get("result") or []
+                if code != 0 or not result:
+                    msg = j.get("message") or json.dumps(data, ensure_ascii=False)[:120]
+                    _log_kol_debug(debug, "search_video_by_name", False, f"{order} page={page}: {msg}", 0, code)
+                    if page == 1:
+                        break
+                    continue
+
+                page_bvids_for_detail = []
+                hit_direct = 0
+                for v in result:
+                    row = _as_video_row(v)
+                    if not row or row["bvid"] in seen_bvids:
+                        continue
+                    result_mid = _norm_mid(v.get("mid") or v.get("owner_mid"))
+                    author = _clean_bili_title(v.get("author", ""))
+                    if result_mid == _norm_mid(mid):
+                        rows.append(row)
+                        seen_bvids.add(row["bvid"])
+                        hit_direct += 1
+                    elif (not result_mid) and author and author == owner_name:
+                        page_bvids_for_detail.append(row["bvid"])
+                    elif author == owner_name:
+                        # 有些搜索结果 mid 字段缺失或类型异常，用详情再确认一次。
+                        page_bvids_for_detail.append(row["bvid"])
+                    if len(rows) >= n:
+                        break
+
+                if len(rows) < n and page_bvids_for_detail:
+                    more = _detail_rows_from_bvids(page_bvids_for_detail, mid, n - len(rows), sess, sleep_sec, debug, source="search_detail_filter")
+                    for r2 in more:
+                        if r2.get("bvid") not in seen_bvids:
+                            rows.append(r2)
+                            seen_bvids.add(r2.get("bvid"))
+
+                _log_kol_debug(debug, "search_video_by_name", bool(hit_direct or page_bvids_for_detail), f"{order} page={page} direct={hit_direct} verify={len(page_bvids_for_detail)}", hit_direct + len(page_bvids_for_detail), code)
+            except Exception as e:
+                _log_kol_debug(debug, "search_video_by_name", False, f"{order} page={page}: {type(e).__name__}: {e}", 0, "EXC")
+                if page == 1:
+                    break
+            _sleep_jitter(sleep_sec)
+        rows = _dedupe_rows(rows, n)
+        if len(rows) >= max(1, min(n, 3)):
+            return rows[:n]
+    return _dedupe_rows(rows, n)
+
 def fetch_vlist_by_mid(
     mid: int,
     n: int = 30,
@@ -876,15 +1101,18 @@ def fetch_vlist_by_mid(
     sleep_sec: float = 0.8,
     cookie: str = "",
     debug: list | None = None,
+    owner_name: str = "",
 ) -> list[dict]:
     """
-    KOL近期公开视频列表抓取优化版（只服务 KOL 模块）：
+    KOL近期公开视频列表抓取增强版（只服务 KOL 模块）：
     1）先访问UP个人主页，建立 Session/Cookie；
     2）Web WBI 投稿接口；
     3）老 Web 投稿接口；
-    4）APP cursor 投稿接口（无需 WBI，是本版新增核心兜底）；
-    5）空间HTML BV提取；
-    6）可选 Selenium 无头浏览器兜底。
+    4）APP cursor 投稿接口；
+    5）动态流提取 BV 并详情过滤；
+    6）按昵称全站视频搜索并按 owner_mid 严格过滤；
+    7）空间HTML BV提取；
+    8）可选 Selenium 无头浏览器兜底。
     """
     space_url = f"https://space.bilibili.com/{mid}/video"
     sess = _make_bili_session(referer=space_url, cookie=cookie)
@@ -896,34 +1124,48 @@ def fetch_vlist_by_mid(
         _log_kol_debug(debug, "space_warmup", False, f"{type(e).__name__}: {e}", 0, "EXC")
 
     out = []
+    target_need = max(1, min(int(n), 6))  # 不是拿到3条就停；至少尽量拿够低样本阈值
 
     # A. Web WBI
     out = _dedupe_rows(out + _fetch_vlist_by_mid_web_wbi(mid, n, sess, sleep_sec, debug), n)
-    if len(out) >= max(1, min(n, 3)):
+    if len(out) >= target_need:
         return out[:n]
 
     # B. 老接口
     out = _dedupe_rows(out + _fetch_vlist_by_mid_web_old(mid, n, sess, sleep_sec, debug), n)
-    if len(out) >= max(1, min(n, 3)):
+    if len(out) >= target_need:
         return out[:n]
 
     # C. APP cursor 兜底
     out = _dedupe_rows(out + _fetch_vlist_by_mid_app_cursor(mid, n, sess, sleep_sec, debug), n)
-    if len(out) >= max(1, min(n, 3)):
+    if len(out) >= target_need:
         return out[:n]
 
-    # D. 直接读取空间页HTML兜底
+    # D. 动态流兜底
+    out = _dedupe_rows(out + _fetch_vlist_by_mid_dynamic(mid, n, sess, sleep_sec, cookie=cookie, debug=debug), n)
+    if len(out) >= target_need:
+        return out[:n]
+
+    # E. 全站搜索兜底（按昵称召回，再用owner_mid过滤）
+    out = _dedupe_rows(out + _fetch_vlist_by_mid_search(mid, owner_name, n, sess, sleep_sec, debug=debug), n)
+    if len(out) >= target_need:
+        return out[:n]
+
+    # F. 直接读取空间页HTML兜底
     try:
         html = sess.get(space_url, timeout=12).text
-        html_rows = _extract_video_rows_from_html(html, n=n, cookie=cookie)
+        bvids = _extract_bvids_from_any(html, limit=max(n * 3, 30))
+        html_rows = _detail_rows_from_bvids(bvids, mid, n, sess, sleep_sec, debug, source="space_html_detail_filter")
+        if not html_rows:
+            html_rows = _extract_video_rows_from_html(html, n=n, cookie=cookie)
         _log_kol_debug(debug, "space_html_bv_extract", bool(html_rows), f"html_bv={len(html_rows)}", len(html_rows), "")
         out = _dedupe_rows(out + html_rows, n)
-        if len(out) >= max(1, min(n, 3)):
+        if len(out) >= target_need:
             return out[:n]
     except Exception as e:
         _log_kol_debug(debug, "space_html_bv_extract", False, f"{type(e).__name__}: {e}", 0, "EXC")
 
-    # E. 可选无头浏览器打开UP主页，拿浏览器cookie后重试
+    # G. 可选无头浏览器打开UP主页，拿浏览器cookie后重试
     if use_browser_fallback:
         html, browser_cookies = _open_space_with_headless_browser(mid)
         if browser_cookies:
@@ -934,13 +1176,15 @@ def fetch_vlist_by_mid(
                     sess.cookies.set(k, v)
             more = _fetch_vlist_by_mid_web_wbi(mid, n, sess, sleep_sec, debug)
             out = _dedupe_rows(out + more, n)
+            if len(out) < target_need:
+                out = _dedupe_rows(out + _fetch_vlist_by_mid_dynamic(mid, n, sess, sleep_sec, cookie=cookie, debug=debug), n)
         if html:
-            html_rows = _extract_video_rows_from_html(html, n=n, cookie=cookie)
+            bvids = _extract_bvids_from_any(html, limit=max(n * 3, 30))
+            html_rows = _detail_rows_from_bvids(bvids, mid, n, sess, sleep_sec, debug, source="selenium_html_detail_filter")
             _log_kol_debug(debug, "selenium_html_bv_extract", bool(html_rows), f"html_bv={len(html_rows)}", len(html_rows), "")
             out = _dedupe_rows(out + html_rows, n)
 
     return out[:n]
-
 
 def _detail_row_for_project(detail: dict, project: str, url: str = "", data_type: str = "collab", baseline_for: str = "") -> dict:
     """把详情接口结果统一转成数据库行。"""
@@ -1380,6 +1624,7 @@ with st.expander("KOL模块设置", expanded=False):
     sleep_sec = st.slider("抓取间隔（防限流）", 0.2, 2.0, 0.8, step=0.1)
     use_browser_fallback = st.checkbox("启用 Selenium 无头浏览器兜底（本机需安装 Chrome/Driver；一般不用开）", value=False)
     show_kol_quality_hint = st.checkbox("显示数据质量提示（缺mid/异常mid/抓取诊断）", value=True)
+    allow_small_sample_kol = st.checkbox("基准少于最低样本时也生成结果（标记为小样本）", value=True)
     bili_cookie = st.text_input(
         "B站 Cookie（可选，仅KOL抓取用；公开数据通常留空即可）",
         value=os.environ.get("BILI_COOKIE", ""),
@@ -1393,7 +1638,7 @@ with cA:
 with cB:
     btn_build_kol = st.button("📚 生成KOL对比表（含标注）")
 with cC:
-    st.caption("本版关键：先用合作BV修复owner_mid，再按mid抓基准；抓取链路为 Web WBI → 老接口 → APP cursor → HTML BV → 可选Selenium。")
+    st.caption("本版关键：先用合作BV修复owner_mid，再按mid抓基准；抓取链路为 Web WBI → 老接口 → APP cursor → 动态流 → 昵称搜索 → HTML BV → 可选Selenium；低样本会标记而不是直接丢弃。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
@@ -1479,7 +1724,12 @@ if collab_projects:
                          .agg(lambda s: s.value_counts().index[0]).to_dict()) if not valid_mid_df_work.empty else {}
 
         # ========= A1) 补齐 baseline =========
-        existed_baseline = set(df_db_work[df_db_work["project"] == BASELINE_PROJECT]["bvid"].astype(str).tolist())
+        baseline_existing_df = df_db_work[df_db_work["project"] == BASELINE_PROJECT].copy()
+        if not baseline_existing_df.empty:
+            baseline_existing_df["owner_mid"] = baseline_existing_df["owner_mid"].apply(_norm_mid)
+            existed_baseline_map = dict(zip(baseline_existing_df["bvid"].astype(str), baseline_existing_df["owner_mid"].astype(str)))
+        else:
+            existed_baseline_map = {}
         baseline_rows_to_write = {}
 
         mids = sorted(valid_mid_df_work["owner_mid"].unique().tolist())
@@ -1500,6 +1750,7 @@ if collab_projects:
                         sleep_sec=float(sleep_sec),
                         cookie=bili_cookie,
                         debug=per_mid_debug,
+                        owner_name=disp,
                     )
                     for d in per_mid_debug:
                         d["owner_mid"] = mid
@@ -1516,7 +1767,8 @@ if collab_projects:
 
                 for v in vlist:
                     bvid = v["bvid"]
-                    if bvid in existed_baseline:
+                    # 旧版可能已写入同一个 bvid 但 owner_mid 为空/错误；这类不能跳过，必须覆盖修复。
+                    if existed_baseline_map.get(bvid, "") == str(mid):
                         continue
 
                     base_row = {
@@ -1540,7 +1792,7 @@ if collab_projects:
                         "fetched_at": pd.Timestamp.now(),
                     }
                     baseline_rows_to_write[(BASELINE_PROJECT, bvid)] = base_row
-                    existed_baseline.add(bvid)
+                    existed_baseline_map[bvid] = str(mid)
                     stat["vlist_added"] += 1
 
                     detail = fetch_video_detail_by_bvid(bvid, sess=detail_sess)
@@ -1601,13 +1853,21 @@ if collab_projects:
         base_pool = _sort_owner_hist(base_pool)
 
         avail = int(min(len(base_pool), baseline_window_n))
+        if avail >= baseline_min_n:
+            diag_status = "OK"
+        elif avail > 0 and allow_small_sample_kol:
+            diag_status = f"小样本可用({avail}/{baseline_min_n})"
+        elif avail > 0:
+            diag_status = f"基准不足({avail}/{baseline_min_n})"
+        else:
+            diag_status = "无可用基准"
         diag.append({
             "owner_mid": mid,
             "KOL/UP主": name_map.get(mid, owner_all["owner_name"].dropna().iloc[0] if not owner_all.empty else ""),
             "库内视频总数": int(len(owner_all)),
             "可用基准数(平时池)": int(len(base_pool)),
             f"取最近{baseline_window_n}可用": avail,
-            "状态": "OK" if avail >= baseline_min_n else f"基准不足(<{baseline_min_n})",
+            "状态": diag_status,
         })
     if diag:
         st.dataframe(pd.DataFrame(diag).sort_values(["状态","可用基准数(平时池)"], ascending=[True, False]),
@@ -1636,7 +1896,8 @@ if collab_projects:
             base_pool = base_pool.drop_duplicates(subset=["bvid"], keep="last")
             base_pool = _sort_owner_hist(base_pool).head(baseline_window_n)
 
-            if len(base_pool) < baseline_min_n:
+            sample_status = "OK" if len(base_pool) >= baseline_min_n else f"小样本({len(base_pool)}/{baseline_min_n})"
+            if len(base_pool) < baseline_min_n and not (allow_small_sample_kol and len(base_pool) > 0):
                 continue
 
             base_view = float(base_pool["view"].median())
@@ -1667,6 +1928,7 @@ if collab_projects:
                 "标注": mark,
                 "合作视频数": int(len(g_collab)),
                 "基准样本数": int(len(base_pool)),
+                "样本状态": sample_status,
                 "标签": "、".join(tags),
                 "KOL画像一句话": persona,
                 "合作播放中位数": int(collab_view),
