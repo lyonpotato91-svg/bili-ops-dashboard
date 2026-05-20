@@ -3161,6 +3161,117 @@ def _build_snapshot_compare(df_current: pd.DataFrame, df_snap: pd.DataFrame, bd_
     return video_rows, pd.DataFrame(proj_rows).sort_values("累计播放", ascending=False)
 
 
+def _snapshot_has_within(sg: pd.DataFrame, pubdate, days: int) -> bool:
+    if pd.isna(pubdate) or sg is None or sg.empty:
+        return False
+    s = sg.copy()
+    s["fetched_at"] = pd.to_datetime(s["fetched_at"], errors="coerce")
+    pool = s[(s["fetched_at"] >= pubdate) & (s["fetched_at"] <= pubdate + pd.Timedelta(days=days))]
+    return not pool.empty
+
+
+def _build_snapshot_health(df_current: pd.DataFrame, df_snap: pd.DataFrame, bd_projects: list[str]) -> pd.DataFrame:
+    cur = df_current[(df_current["project"].isin(bd_projects)) & (df_current["project"] != BASELINE_PROJECT)].copy()
+    if cur.empty:
+        return pd.DataFrame()
+    cur = normalize_df(cur)
+    cur["pubdate"] = pd.to_datetime(cur["pubdate"], errors="coerce")
+    now = pd.Timestamp.now()
+    snap = df_snap.copy() if df_snap is not None and not df_snap.empty else pd.DataFrame()
+    if not snap.empty:
+        snap = snap[(snap["project"].isin(bd_projects)) & (snap["project"] != BASELINE_PROJECT)].copy()
+        snap["fetched_at"] = pd.to_datetime(snap["fetched_at"], errors="coerce")
+
+    rows = []
+    for _, r in cur.iterrows():
+        pub = r.get("pubdate", pd.NaT)
+        age_hours = ((now - pub).total_seconds() / 3600.0) if pd.notna(pub) else np.nan
+        sg = snap[(snap["project"] == r.get("project")) & (snap["bvid"] == r.get("bvid"))].copy() if not snap.empty else pd.DataFrame()
+        has_1d = _snapshot_has_within(sg, pub, 1)
+        has_3d = _snapshot_has_within(sg, pub, 3)
+        has_7d = _snapshot_has_within(sg, pub, 7)
+        if pd.isna(age_hours):
+            status = "发布时间缺失"
+        elif age_hours <= 24 and not has_1d:
+            status = "首日窗口内，需尽快快照"
+        elif age_hours > 24 and not has_1d:
+            status = "首日已错过"
+        elif age_hours <= 72 and not has_3d:
+            status = "3日窗口内，需继续快照"
+        elif age_hours > 72 and not has_3d:
+            status = "3日已错过"
+        elif age_hours <= 168 and not has_7d:
+            status = "7日窗口内，需继续快照"
+        elif age_hours > 168 and not has_7d:
+            status = "7日已错过"
+        else:
+            status = "快照完整"
+        rows.append({
+            "project": r.get("project", ""),
+            "bvid": r.get("bvid", ""),
+            "title": r.get("title", ""),
+            "owner_name": r.get("owner_name", ""),
+            "pubdate": pub,
+            "发布后小时": round(age_hours, 1) if not pd.isna(age_hours) else np.nan,
+            "快照数": int(len(sg)),
+            "首日快照": "有" if has_1d else "无",
+            "3日快照": "有" if has_3d else "无",
+            "7日快照": "有" if has_7d else "无",
+            "快照状态": status,
+        })
+    out = pd.DataFrame(rows)
+    order = {
+        "首日窗口内，需尽快快照": 0,
+        "3日窗口内，需继续快照": 1,
+        "7日窗口内，需继续快照": 2,
+        "首日已错过": 3,
+        "3日已错过": 4,
+        "7日已错过": 5,
+        "发布时间缺失": 6,
+        "快照完整": 9,
+    }
+    out["状态优先级"] = out["快照状态"].map(order).fillna(8)
+    return out.sort_values(["状态优先级", "发布后小时"], ascending=[True, True])
+
+
+def _restore_snapshot_backup(df_restore: pd.DataFrame) -> tuple[bool, int, str]:
+    if df_restore is None or df_restore.empty:
+        return False, 0, "文件为空"
+    init_db()
+    cols = [
+        "project", "bvid", "snapshot_date", "fetched_at", "pubdate", "owner_mid", "owner_name", "title",
+        "view", "like", "coin", "favorite", "reply", "danmaku", "share",
+        "engagement", "engagement_rate", "deep_signal_ratio", "data_type"
+    ]
+    d = df_restore.copy()
+    for c in cols:
+        if c not in d.columns:
+            d[c] = None
+    if "snapshot_date" in d.columns:
+        d["snapshot_date"] = d["snapshot_date"].fillna("")
+    missing_date = d["snapshot_date"].astype(str).str.strip() == ""
+    d.loc[missing_date, "snapshot_date"] = pd.to_datetime(d.loc[missing_date, "fetched_at"], errors="coerce").dt.strftime("%Y-%m-%d")
+    d["fetched_at"] = pd.to_datetime(d["fetched_at"], errors="coerce").fillna(pd.Timestamp.now()).dt.strftime("%Y-%m-%d %H:%M:%S")
+    d["pubdate"] = pd.to_datetime(d["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    d = d[d["bvid"].astype(str).str.startswith("BV")].copy()
+    if d.empty:
+        return False, 0, "没有有效BV快照行"
+    records = []
+    for _, r in d[cols].iterrows():
+        records.append(tuple(None if pd.isna(v) else v for v in r.tolist()))
+    placeholders = ",".join(["?"] * len(cols))
+    colnames = ",".join(cols)
+    sql = f"INSERT OR REPLACE INTO {SNAPSHOT_TABLE_NAME} ({colnames}) VALUES ({placeholders})"
+    with db_conn() as conn:
+        conn.executemany(sql, records)
+        conn.commit()
+    try:
+        _save_snapshot_backup_csv(load_snapshots())
+    except Exception:
+        pass
+    return True, len(records), "恢复完成"
+
+
 def _project_review_text(proj: str, decision_df: pd.DataFrame, kol_lib: pd.DataFrame, video_df: pd.DataFrame) -> str:
     if decision_df is None or decision_df.empty or proj not in decision_df["project"].astype(str).tolist():
         return "暂无可生成的复盘内容。"
@@ -3387,8 +3498,8 @@ else:
         bd_snapshots = load_snapshots()
         bd_video_growth, bd_project_growth = _build_snapshot_compare(df_db, bd_snapshots, bd_projects)
 
-    tab_bd0, tab_bd1, tab_bd2, tab_bd3, tab_bd4, tab_bd5 = st.tabs([
-        "可视化总览", "项目分层", "KOL适配标签", "首日/累计表现", "风险状态", "复盘模板"
+    tab_bd0, tab_bd1, tab_bd2, tab_bd3, tab_bd4, tab_bd5, tab_bd6 = st.tabs([
+        "可视化总览", "项目分层", "KOL适配标签", "首日/累计表现", "风险状态", "复盘模板", "快照备份"
     ])
 
     with tab_bd0:
@@ -3472,4 +3583,81 @@ else:
                 "复盘文案",
                 value=_project_review_text(review_project, bd_project_decision, bd_kol_lib, bd_video_growth),
                 height=260,
+            )
+
+    with tab_bd6:
+        st.markdown("**快照备份 / 恢复 / 健康检查**")
+        st.caption("首日、3日、7日表现依赖快照。BV可以重拉累计，但错过的历史快照无法准确补回。建议定期下载快照备份CSV。")
+
+        snap_all = load_snapshots()
+        health_df = _build_snapshot_health(df_db, snap_all, bd_projects)
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("快照记录数", 0 if snap_all is None or snap_all.empty else len(snap_all))
+        s2.metric("覆盖视频数", 0 if snap_all is None or snap_all.empty else snap_all["bvid"].nunique())
+        if health_df.empty:
+            s3.metric("首日覆盖率", "-")
+            s4.metric("需关注视频", "-")
+        else:
+            s3.metric("首日覆盖率", f"{(health_df['首日快照'].eq('有').mean() * 100):.1f}%")
+            s4.metric("需关注视频", int((health_df["快照状态"] != "快照完整").sum()))
+
+        if snap_all is not None and not snap_all.empty:
+            st.download_button(
+                "下载快照备份CSV",
+                data=snap_all.to_csv(index=False).encode("utf-8-sig"),
+                file_name="backup_snapshots_latest.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("当前暂无快照可下载。页面打开后会自动记录当前项目数据为今日快照。")
+
+        uploaded_snap = st.file_uploader("上传快照备份CSV恢复", type=["csv"], key="snapshot_restore_upload")
+        if uploaded_snap is not None and st.button("恢复快照备份", key="snapshot_restore_btn"):
+            raw = uploaded_snap.getvalue()
+            df_restore = None
+            for enc in ["utf-8-sig", "utf-8", "gbk"]:
+                try:
+                    df_restore = pd.read_csv(io.BytesIO(raw), encoding=enc)
+                    break
+                except Exception:
+                    df_restore = None
+            ok, cnt, msg = _restore_snapshot_backup(df_restore)
+            if ok:
+                st.success(f"{msg}：{cnt} 条快照。")
+                st.rerun()
+            else:
+                st.error(f"恢复失败：{msg}")
+
+        if not health_df.empty:
+            st.markdown("**快照健康检查**")
+            status_counts = health_df["快照状态"].value_counts().reset_index()
+            status_counts.columns = ["快照状态", "视频数"]
+            fig_health = px.bar(
+                status_counts,
+                x="快照状态",
+                y="视频数",
+                color="快照状态",
+                text="视频数",
+                height=360,
+            )
+            fig_health.update_traces(textposition="outside", showlegend=False)
+            fig_health.update_layout(xaxis_title="状态", yaxis_title="视频数")
+            st.plotly_chart(fig_health, use_container_width=True)
+
+            show_health = health_df.copy()
+            show_health["pubdate"] = pd.to_datetime(show_health["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(
+                show_health[[
+                    "project", "bvid", "title", "owner_name", "pubdate", "发布后小时",
+                    "快照数", "首日快照", "3日快照", "7日快照", "快照状态"
+                ]],
+                use_container_width=True,
+                height=460,
+            )
+
+            st.download_button(
+                "下载BV清单+快照状态CSV",
+                data=show_health.to_csv(index=False).encode("utf-8-sig"),
+                file_name="snapshot_health_check.csv",
+                mime="text/csv",
             )
