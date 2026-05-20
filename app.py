@@ -978,6 +978,99 @@ def _fetch_vlist_by_dynamic_space(mid: int, n: int, sess: requests.Session, slee
     return _dedupe_rows(rows, n)
 
 
+def _fetch_vlist_by_related_bvids(mid: int, seed_bvids: list[str], n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
+    """
+    从已知合作视频出发，读取“相关视频/作者更多”接口。
+    只保留详情接口反查 owner_mid 一致的视频，避免推荐视频串号。
+    """
+    rows = []
+    seen = set()
+    seed_bvids = [str(x) for x in (seed_bvids or []) if str(x).startswith("BV")]
+    if not seed_bvids:
+        _log_kol_debug(debug, "related_by_seed", False, "skip: no seed bvid", 0, "NO_SEED")
+        return []
+
+    api = "https://api.bilibili.com/x/web-interface/archive/related"
+    for seed in seed_bvids[:3]:
+        if len(rows) >= n:
+            break
+        try:
+            r = sess.get(api, params={"bvid": seed}, headers={"Referer": f"https://www.bilibili.com/video/{seed}"}, timeout=12)
+            j = r.json()
+            code = j.get("code", -1)
+            data = j.get("data") or []
+            if code != 0 or not data:
+                msg = j.get("message") or "empty"
+                _log_kol_debug(debug, "related_by_seed", False, f"{seed}: {msg}", 0, code)
+                continue
+
+            matched = 0
+            checked = 0
+            for item in data:
+                bvid = item.get("bvid") or parse_bvid(_safe_str(item.get("uri") or item.get("arcurl") or item.get("url") or ""))
+                if not bvid or bvid in seen:
+                    continue
+                seen.add(bvid)
+                checked += 1
+                detail = fetch_video_detail_by_bvid(bvid, sess=sess)
+                if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
+                    rows.append(_detail_to_video_row(detail))
+                    matched += 1
+                    if len(rows) >= n:
+                        break
+                _sleep_jitter(0.18)
+            _log_kol_debug(debug, "related_by_seed", matched > 0, f"{seed}: checked={checked}, matched_mid={matched}", matched, code)
+        except Exception as e:
+            _log_kol_debug(debug, "related_by_seed", False, f"{seed}: {type(e).__name__}: {e}", 0, "EXC")
+        _sleep_jitter(sleep_sec)
+
+    return _dedupe_rows(rows, n)
+
+
+def _fetch_vlist_by_seed_video_html(mid: int, seed_bvids: list[str], n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
+    """
+    从合作视频详情页 HTML 中提取 BV，再用详情接口校验 owner_mid。
+    这是最后兜底之一，适合投稿/动态接口都不给列表的账号。
+    """
+    rows = []
+    seen = set()
+    seed_bvids = [str(x) for x in (seed_bvids or []) if str(x).startswith("BV")]
+    if not seed_bvids:
+        _log_kol_debug(debug, "seed_video_html", False, "skip: no seed bvid", 0, "NO_SEED")
+        return []
+
+    for seed in seed_bvids[:3]:
+        if len(rows) >= n:
+            break
+        try:
+            html = sess.get(f"https://www.bilibili.com/video/{seed}", headers={"Referer": f"https://www.bilibili.com/video/{seed}"}, timeout=12).text
+            bvids = []
+            for bv in re.findall(r"BV[0-9A-Za-z]{10}", html or ""):
+                if bv not in bvids:
+                    bvids.append(bv)
+                if len(bvids) >= max(60, n * 4):
+                    break
+
+            matched = 0
+            for bvid in bvids:
+                if bvid in seen:
+                    continue
+                seen.add(bvid)
+                detail = fetch_video_detail_by_bvid(bvid, sess=sess)
+                if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
+                    rows.append(_detail_to_video_row(detail))
+                    matched += 1
+                    if len(rows) >= n:
+                        break
+                _sleep_jitter(0.18)
+            _log_kol_debug(debug, "seed_video_html", matched > 0, f"{seed}: html_bv={len(bvids)}, matched_mid={matched}", matched, "")
+        except Exception as e:
+            _log_kol_debug(debug, "seed_video_html", False, f"{seed}: {type(e).__name__}: {e}", 0, "EXC")
+        _sleep_jitter(sleep_sec)
+
+    return _dedupe_rows(rows, n)
+
+
 def _fetch_vlist_by_mid_web_wbi(mid: int, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
     """Web 端 UP 投稿列表：主路径。"""
     api = "https://api.bilibili.com/x/space/wbi/arc/search"
@@ -1256,6 +1349,7 @@ def fetch_vlist_by_mid(
     cookie: str = "",
     proxy: str = "",
     owner_name: str = "",
+    seed_bvids: list[str] | None = None,
     debug: list | None = None,
 ) -> list[dict]:
     """
@@ -1292,10 +1386,16 @@ def fetch_vlist_by_mid(
     # 4. 动态页兜底：部分账号投稿列表为空，但动态页能抽到近期视频
     if len(out) < n:
         _merge(_fetch_vlist_by_dynamic_space(mid, n, sess, sleep_sec, debug), "dynamic_space")
-    # 5. 昵称搜索兜底：用于空间投稿接口被风控/为空的账号
+    # 5. 从合作视频出发找“相关/作者更多”视频
+    if len(out) < n and seed_bvids:
+        _merge(_fetch_vlist_by_related_bvids(mid, seed_bvids, n, sess, sleep_sec, debug), "related_by_seed")
+    # 6. 从合作视频详情页 HTML 抽 BV
+    if len(out) < n and seed_bvids:
+        _merge(_fetch_vlist_by_seed_video_html(mid, seed_bvids, n, sess, sleep_sec, debug), "seed_video_html")
+    # 7. 昵称搜索兜底：用于空间投稿接口被风控/为空的账号
     if len(out) < n:
         _merge(_fetch_vlist_by_owner_search(mid, owner_name, n, sess, sleep_sec, cookie=cookie, proxy=proxy, debug=debug), "owner_video_search")
-    # 6. HTML BV 提取兜底
+    # 8. 空间 HTML BV 提取兜底
     if len(out) < n:
         try:
             html = sess.get(space_url, timeout=12).text
@@ -1312,7 +1412,7 @@ def fetch_vlist_by_mid(
         except Exception as e:
             _log_kol_debug(debug, "space_html_bv_extract", False, f"{type(e).__name__}: {e}", 0, "EXC")
 
-    # 7. 可选 Selenium，无依赖时静默跳过
+    # 9. 可选 Selenium，无依赖时静默跳过
     if len(out) < n and use_browser_fallback:
         html, browser_cookies = _open_space_with_headless_browser(mid)
         if browser_cookies:
@@ -2321,6 +2421,7 @@ if collab_projects:
                 disp = name_map_work.get(mid, "")
                 status.info(f"正在抓取KOL基准：{disp or mid}（mid={mid}）")
                 per_mid_debug = []
+                seed_bvids_this_mid = valid_mid_df_work[valid_mid_df_work["owner_mid"].apply(_norm_mid) == _norm_mid(mid)]["bvid"].astype(str).tolist()
                 try:
                     vlist = fetch_vlist_by_mid(
                         int(mid),
@@ -2330,6 +2431,7 @@ if collab_projects:
                         cookie=bili_cookie,
                         proxy=bili_proxy,
                         owner_name=disp,
+                        seed_bvids=seed_bvids_this_mid,
                         debug=per_mid_debug,
                     )
                     for d in per_mid_debug:
