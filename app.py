@@ -1071,6 +1071,179 @@ def _fetch_vlist_by_seed_video_html(mid: int, seed_bvids: list[str], n: int, ses
     return _dedupe_rows(rows, n)
 
 
+def _rows_from_verified_bvids(mid: int, bvids: list[str], n: int, sess: requests.Session, debug: list | None, source: str) -> list[dict]:
+    rows = []
+    seen = set()
+    checked = 0
+    for bvid in bvids:
+        if len(rows) >= n:
+            break
+        bvid = parse_bvid(_safe_str(bvid)) or _safe_str(bvid)
+        if not bvid or bvid in seen:
+            continue
+        seen.add(bvid)
+        checked += 1
+        detail = fetch_video_detail_by_bvid(bvid, sess=sess)
+        if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
+            rows.append(_detail_to_video_row(detail))
+        _sleep_jitter(0.16)
+    _log_kol_debug(debug, source, len(rows) > 0, f"checked={checked}, matched_mid={len(rows)}", len(rows), "")
+    return _dedupe_rows(rows, n)
+
+
+def _fetch_vlist_by_collections(mid: int, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
+    """
+    合集/视频列表兜底：部分老 UP 或分区账号会把视频放在合集/列表里，
+    投稿列表接口为空时，这一路仍可能拿到 archives。
+    """
+    rows = []
+    bvids = []
+    season_ids = []
+    series_ids = []
+    base_headers = {"Referer": f"https://space.bilibili.com/{mid}/lists"}
+
+    def add_bvids_from_obj(obj):
+        for bv in _extract_bvids_deep(obj, limit=max(120, n * 5)):
+            if bv not in bvids:
+                bvids.append(bv)
+
+    def collect_ids(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "season_id":
+                    sid = _safe_int(v, default=0)
+                    if sid > 0 and sid not in season_ids:
+                        season_ids.append(sid)
+                elif k == "series_id":
+                    sid = _safe_int(v, default=0)
+                    if sid > 0 and sid not in series_ids:
+                        series_ids.append(sid)
+                collect_ids(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                collect_ids(x)
+
+    # 1) 主页合集/系列概览，常直接带 archives。
+    overview_apis = [
+        "https://api.bilibili.com/x/polymer/web-space/home/seasons_series",
+        "https://api.bilibili.com/x/polymer/web-space/seasons_series_list",
+    ]
+    for api in overview_apis:
+        if len(rows) >= n:
+            break
+        for page in range(1, 4):
+            params = {
+                "mid": mid,
+                "page_num": page,
+                "page_size": 20,
+                "web_location": "333.999",
+            }
+            try:
+                try:
+                    signed = _wbi_sign(params, sess=sess)
+                except Exception:
+                    signed = params
+                r = sess.get(api, params=signed, headers=base_headers, timeout=12)
+                j = r.json()
+                code = j.get("code", -1)
+                data = j.get("data") or {}
+                if code != 0 or not data:
+                    msg = j.get("message") or "empty"
+                    _log_kol_debug(debug, "collections_overview", False, f"{api.split('/')[-1]} p{page}: {msg}", 0, code)
+                    break
+                add_bvids_from_obj(data)
+                collect_ids(data)
+                _log_kol_debug(debug, "collections_overview", bool(bvids or season_ids or series_ids), f"{api.split('/')[-1]} p{page}: bvids={len(bvids)}, seasons={len(season_ids)}, series={len(series_ids)}", len(bvids), code)
+                page_info = ((data.get("items_lists") or {}).get("page")) or data.get("page") or {}
+                total = _safe_int(page_info.get("total", 0), default=0)
+                if total and page >= max(1, int(np.ceil(total / 20))):
+                    break
+            except Exception as e:
+                _log_kol_debug(debug, "collections_overview", False, f"{api.split('/')[-1]} p{page}: {type(e).__name__}: {e}", 0, "EXC")
+                break
+            _sleep_jitter(sleep_sec)
+
+    if bvids:
+        rows = _dedupe_rows(rows + _rows_from_verified_bvids(mid, bvids, n, sess, debug, "collections_overview_verify"), n)
+        if len(rows) >= n:
+            return rows[:n]
+
+    # 2) 按 season_id / series_id 展开完整列表。
+    for season_id in season_ids[:8]:
+        if len(rows) >= n:
+            break
+        for page in range(1, 4):
+            params = {
+                "mid": mid,
+                "season_id": season_id,
+                "sort_reverse": "false",
+                "page_num": page,
+                "page_size": 30,
+                "web_location": "333.999",
+            }
+            try:
+                try:
+                    signed = _wbi_sign(params, sess=sess)
+                except Exception:
+                    signed = params
+                r = sess.get("https://api.bilibili.com/x/polymer/web-space/seasons_archives_list", params=signed, headers=base_headers, timeout=12)
+                j = r.json()
+                code = j.get("code", -1)
+                data = j.get("data") or {}
+                archives = data.get("archives") or []
+                page_bvids = _extract_bvids_deep(archives, limit=80)
+                if code == 0 and page_bvids:
+                    rows = _dedupe_rows(rows + _rows_from_verified_bvids(mid, page_bvids, n, sess, debug, "season_archives_verify"), n)
+                    _log_kol_debug(debug, "season_archives", True, f"season={season_id} p{page}, bvids={len(page_bvids)}", len(page_bvids), code)
+                else:
+                    msg = j.get("message") or "empty"
+                    _log_kol_debug(debug, "season_archives", False, f"season={season_id} p{page}: {msg}", 0, code)
+                    break
+                total = _safe_int((data.get("page") or {}).get("total", 0), default=0)
+                if total and page >= max(1, int(np.ceil(total / 30))):
+                    break
+            except Exception as e:
+                _log_kol_debug(debug, "season_archives", False, f"season={season_id} p{page}: {type(e).__name__}: {e}", 0, "EXC")
+                break
+            _sleep_jitter(sleep_sec)
+
+    for series_id in series_ids[:8]:
+        if len(rows) >= n:
+            break
+        for page in range(1, 4):
+            params = {
+                "mid": mid,
+                "series_id": series_id,
+                "only_normal": "true",
+                "sort": "desc",
+                "pn": page,
+                "ps": 30,
+            }
+            try:
+                r = sess.get("https://api.bilibili.com/x/series/archives", params=params, headers=base_headers, timeout=12)
+                j = r.json()
+                code = j.get("code", -1)
+                data = j.get("data") or {}
+                archives = data.get("archives") or []
+                page_bvids = _extract_bvids_deep(archives, limit=80)
+                if code == 0 and page_bvids:
+                    rows = _dedupe_rows(rows + _rows_from_verified_bvids(mid, page_bvids, n, sess, debug, "series_archives_verify"), n)
+                    _log_kol_debug(debug, "series_archives", True, f"series={series_id} p{page}, bvids={len(page_bvids)}", len(page_bvids), code)
+                else:
+                    msg = j.get("message") or "empty"
+                    _log_kol_debug(debug, "series_archives", False, f"series={series_id} p{page}: {msg}", 0, code)
+                    break
+                total = _safe_int((data.get("page") or {}).get("total", 0), default=0)
+                if total and page >= max(1, int(np.ceil(total / 30))):
+                    break
+            except Exception as e:
+                _log_kol_debug(debug, "series_archives", False, f"series={series_id} p{page}: {type(e).__name__}: {e}", 0, "EXC")
+                break
+            _sleep_jitter(sleep_sec)
+
+    return _dedupe_rows(rows, n)
+
+
 def _fetch_vlist_by_mid_web_wbi(mid: int, n: int, sess: requests.Session, sleep_sec: float, debug: list | None = None) -> list[dict]:
     """Web 端 UP 投稿列表：主路径。"""
     api = "https://api.bilibili.com/x/space/wbi/arc/search"
@@ -1383,19 +1556,22 @@ def fetch_vlist_by_mid(
     # 3. APP cursor 投稿接口
     if len(out) < n:
         _merge(_fetch_vlist_by_mid_app_cursor(mid, n, sess, sleep_sec, debug), "app_archive_cursor")
-    # 4. 动态页兜底：部分账号投稿列表为空，但动态页能抽到近期视频
+    # 4. 合集/视频列表兜底
+    if len(out) < n:
+        _merge(_fetch_vlist_by_collections(mid, n, sess, sleep_sec, debug), "collections")
+    # 5. 动态页兜底：部分账号投稿列表为空，但动态页能抽到近期视频
     if len(out) < n:
         _merge(_fetch_vlist_by_dynamic_space(mid, n, sess, sleep_sec, debug), "dynamic_space")
-    # 5. 从合作视频出发找“相关/作者更多”视频
+    # 6. 从合作视频出发找“相关/作者更多”视频
     if len(out) < n and seed_bvids:
         _merge(_fetch_vlist_by_related_bvids(mid, seed_bvids, n, sess, sleep_sec, debug), "related_by_seed")
-    # 6. 从合作视频详情页 HTML 抽 BV
+    # 7. 从合作视频详情页 HTML 抽 BV
     if len(out) < n and seed_bvids:
         _merge(_fetch_vlist_by_seed_video_html(mid, seed_bvids, n, sess, sleep_sec, debug), "seed_video_html")
-    # 7. 昵称搜索兜底：用于空间投稿接口被风控/为空的账号
+    # 8. 昵称搜索兜底：用于空间投稿接口被风控/为空的账号
     if len(out) < n:
         _merge(_fetch_vlist_by_owner_search(mid, owner_name, n, sess, sleep_sec, cookie=cookie, proxy=proxy, debug=debug), "owner_video_search")
-    # 8. 空间 HTML BV 提取兜底
+    # 9. 空间 HTML BV 提取兜底
     if len(out) < n:
         try:
             html = sess.get(space_url, timeout=12).text
@@ -1412,7 +1588,7 @@ def fetch_vlist_by_mid(
         except Exception as e:
             _log_kol_debug(debug, "space_html_bv_extract", False, f"{type(e).__name__}: {e}", 0, "EXC")
 
-    # 9. 可选 Selenium，无依赖时静默跳过
+    # 10. 可选 Selenium，无依赖时静默跳过
     if len(out) < n and use_browser_fallback:
         html, browser_cookies = _open_space_with_headless_browser(mid)
         if browser_cookies:
@@ -2398,13 +2574,15 @@ if collab_projects:
 
         collab_bvids_all = set(valid_mid_df_work["bvid"].astype(str).tolist())
         mids_all = sorted(valid_mid_df_work["owner_mid"].unique().tolist())
-        mids = []
+        mid_need_rows = []
         for mid in mids_all:
             existing_pool = _existing_personal_base_pool(df_db_work, mid, collab_projects, collab_bvids_all)
             if bool(skip_enough_baseline) and len(existing_pool) >= int(baseline_min_n):
                 stat["mid_skipped_enough"] += 1
                 continue
-            mids.append(mid)
+            mid_need_rows.append((int(len(existing_pool)), _safe_str(name_map_work.get(mid, "")), mid))
+        mid_need_rows = sorted(mid_need_rows, key=lambda x: (x[0], x[1], x[2]))
+        mids = [x[2] for x in mid_need_rows]
         stat["mid_need_total"] = len(mids)
         mids = mids[:int(max_mids_per_run)]
         stat["mid_selected"] = len(mids)
@@ -2559,7 +2737,7 @@ if collab_projects:
             advice = "可参考，建议继续补齐"
         else:
             status_text = "无个人历史基准"
-            advice = "会继续多接口尝试；生成表可用平台替代基准"
+            advice = "优先补齐：投稿/合集/动态/搜索/合作视频反查；多次为0时建议填Cookie"
         diag.append({
             "owner_mid": mid,
             "KOL/UP主": name_map.get(mid, owner_all["owner_name"].dropna().iloc[0] if not owner_all.empty else ""),
@@ -2567,10 +2745,11 @@ if collab_projects:
             "可用个人基准数": int(len(base_pool)),
             f"取最近{baseline_window_n}可用": avail,
             "状态": status_text,
+            "补齐优先级": 0 if avail == 0 else (1 if avail < baseline_min_n else 9),
             "建议": advice,
         })
     if diag:
-        diag_df = pd.DataFrame(diag).sort_values(["状态", "可用个人基准数"], ascending=[True, False])
+        diag_df = pd.DataFrame(diag).sort_values(["补齐优先级", "可用个人基准数"], ascending=[True, True])
         st.dataframe(diag_df, use_container_width=True, height=360)
     else:
         st.info("暂无可诊断的 owner_mid。点击“一键补齐”会先尝试用合作BV详情修复 owner_mid。")
