@@ -97,4 +97,3 @@ def _try_restore_from_backup() -> bool:
     """
     if not os.path.exists(BACKUP_LATEST_CSV):
         return False
-    try:
