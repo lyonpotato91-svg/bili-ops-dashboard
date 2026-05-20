@@ -30,8 +30,10 @@ DB_PATH = os.path.join(APP_DIR, "bili_dashboard.db")
 # ✅ 自动备份（尽可能减少“每周打开空库”）
 BACKUP_DIR = os.path.join(APP_DIR, "backup")
 BACKUP_LATEST_CSV = os.path.join(BACKUP_DIR, "backup_latest.csv")
+BACKUP_SNAPSHOTS_CSV = os.path.join(BACKUP_DIR, "backup_snapshots_latest.csv")
 
 TABLE_NAME = "videos"
+SNAPSHOT_TABLE_NAME = "video_snapshots"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -71,6 +73,30 @@ def init_db():
             PRIMARY KEY (project, bvid)
         )
         """)
+        conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {SNAPSHOT_TABLE_NAME} (
+            project TEXT NOT NULL,
+            bvid TEXT NOT NULL,
+            snapshot_date TEXT NOT NULL,
+            fetched_at TEXT,
+            pubdate TEXT,
+            owner_mid TEXT,
+            owner_name TEXT,
+            title TEXT,
+            view INTEGER,
+            like INTEGER,
+            coin INTEGER,
+            favorite INTEGER,
+            reply INTEGER,
+            danmaku INTEGER,
+            share INTEGER,
+            engagement INTEGER,
+            engagement_rate REAL,
+            deep_signal_ratio REAL,
+            data_type TEXT,
+            PRIMARY KEY (project, bvid, snapshot_date)
+        )
+        """)
         conn.commit()
 
 def _ensure_backup_dir():
@@ -90,6 +116,15 @@ def _save_backup_csv(df_all: pd.DataFrame):
         df_all.to_csv(BACKUP_LATEST_CSV, index=False, encoding="utf-8-sig")
     except Exception:
         # 备份失败不要影响主流程
+        pass
+
+def _save_snapshot_backup_csv(df_snap: pd.DataFrame):
+    if df_snap is None or df_snap.empty:
+        return
+    _ensure_backup_dir()
+    try:
+        df_snap.to_csv(BACKUP_SNAPSHOTS_CSV, index=False, encoding="utf-8-sig")
+    except Exception:
         pass
 
 def _try_restore_from_backup() -> bool:
@@ -181,6 +216,12 @@ def upsert_rows(df_new: pd.DataFrame, skip_backup: bool = False):
     with db_conn() as conn:
         conn.executemany(sql, records)
         conn.commit()
+
+    if not skip_backup:
+        try:
+            _record_video_snapshots(df_new)
+        except Exception:
+            pass
 
     # ✅ 每次写入后自动备份（尽可能防止“打开空库”）
     if not skip_backup:
@@ -352,6 +393,97 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
         df["engagement"] > 0, (df["coin"] + df["favorite"]) / df["engagement"], 0.0
     )
     return df
+
+def _record_video_snapshots(df_rows: pd.DataFrame):
+    """把当前指标按天写入快照表，用于首日/3日/7日/累计表现对比。"""
+    if df_rows is None or df_rows.empty:
+        return
+    init_db()
+    d = normalize_df(df_rows.copy())
+    if d.empty:
+        return
+    d = compute_metrics(d)
+    d["fetched_at"] = pd.to_datetime(d.get("fetched_at", pd.Timestamp.now()), errors="coerce").fillna(pd.Timestamp.now())
+    d["snapshot_date"] = d["fetched_at"].dt.strftime("%Y-%m-%d")
+    d["pubdate"] = pd.to_datetime(d["pubdate"], errors="coerce")
+
+    cols = [
+        "project", "bvid", "snapshot_date", "fetched_at", "pubdate", "owner_mid", "owner_name", "title",
+        "view", "like", "coin", "favorite", "reply", "danmaku", "share",
+        "engagement", "engagement_rate", "deep_signal_ratio", "data_type"
+    ]
+    for c in cols:
+        if c not in d.columns:
+            d[c] = None
+    d = d[cols].copy()
+    d["fetched_at"] = pd.to_datetime(d["fetched_at"], errors="coerce").fillna(pd.Timestamp.now()).dt.strftime("%Y-%m-%d %H:%M:%S")
+    d["pubdate"] = pd.to_datetime(d["pubdate"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    records = []
+    for _, r in d.iterrows():
+        records.append(tuple(None if pd.isna(v) else v for v in r.tolist()))
+    if not records:
+        return
+
+    placeholders = ",".join(["?"] * len(cols))
+    colnames = ",".join(cols)
+    sql = f"INSERT OR REPLACE INTO {SNAPSHOT_TABLE_NAME} ({colnames}) VALUES ({placeholders})"
+    with db_conn() as conn:
+        conn.executemany(sql, records)
+        conn.commit()
+    try:
+        _save_snapshot_backup_csv(load_snapshots())
+    except Exception:
+        pass
+
+def load_snapshots() -> pd.DataFrame:
+    init_db()
+    try:
+        with db_conn() as conn:
+            df = pd.read_sql_query(f"SELECT * FROM {SNAPSHOT_TABLE_NAME}", conn)
+        if df is None or df.empty:
+            if os.path.exists(BACKUP_SNAPSHOTS_CSV):
+                for enc in ["utf-8-sig", "utf-8", "gbk"]:
+                    try:
+                        df_restore = pd.read_csv(BACKUP_SNAPSHOTS_CSV, encoding=enc)
+                        if df_restore is not None and not df_restore.empty:
+                            cols = [
+                                "project", "bvid", "snapshot_date", "fetched_at", "pubdate", "owner_mid", "owner_name", "title",
+                                "view", "like", "coin", "favorite", "reply", "danmaku", "share",
+                                "engagement", "engagement_rate", "deep_signal_ratio", "data_type"
+                            ]
+                            for c in cols:
+                                if c not in df_restore.columns:
+                                    df_restore[c] = None
+                            records = []
+                            for _, r in df_restore[cols].iterrows():
+                                records.append(tuple(None if pd.isna(v) else v for v in r.tolist()))
+                            if records:
+                                placeholders = ",".join(["?"] * len(cols))
+                                colnames = ",".join(cols)
+                                sql = f"INSERT OR REPLACE INTO {SNAPSHOT_TABLE_NAME} ({colnames}) VALUES ({placeholders})"
+                                with db_conn() as conn:
+                                    conn.executemany(sql, records)
+                                    conn.commit()
+                            with db_conn() as conn:
+                                df = pd.read_sql_query(f"SELECT * FROM {SNAPSHOT_TABLE_NAME}", conn)
+                        break
+                    except Exception:
+                        continue
+            if df is None or df.empty:
+                return pd.DataFrame()
+        for c in ["view", "like", "coin", "favorite", "reply", "danmaku", "share", "engagement"]:
+            if c in df.columns:
+                df[c] = df[c].apply(_safe_int)
+        for c in ["engagement_rate", "deep_signal_ratio"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df["pubdate"] = pd.to_datetime(df["pubdate"], errors="coerce")
+        df["fetched_at"] = pd.to_datetime(df["fetched_at"], errors="coerce")
+        df["owner_mid"] = df["owner_mid"].apply(_norm_mid)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 def _sort_owner_hist(df_owner: pd.DataFrame) -> pd.DataFrame:
     g = df_owner.copy()
@@ -1660,6 +1792,7 @@ st.sidebar.title("📊 B站运营Dashboard")
 # ✅ 展示当前DB、备份位置 & 当前记录数（方便判断是不是“环境重置”）
 st.sidebar.caption(f"DB: {DB_PATH}")
 st.sidebar.caption(f"Backup: {BACKUP_LATEST_CSV}")
+st.sidebar.caption(f"Snapshot Backup: {BACKUP_SNAPSHOTS_CSV}")
 
 st.sidebar.markdown("#### 全局“发挥评价”口径（按KOL自身历史，不按时间）")
 baseline_window_n = st.sidebar.slider("基准：取该KOL最近N条视频（按发布时间/抓取时间排序）", 10, 60, 20, step=5)
@@ -1802,6 +1935,11 @@ with st.spinner("正在读取本地数据..."):
     df_db = load_all_rows()
 df_db = normalize_df(df_db) if not df_db.empty else df_db
 st.sidebar.caption(f"Rows: {0 if df_db is None else len(df_db)}")
+if df_db is not None and not df_db.empty:
+    try:
+        _record_video_snapshots(df_db)
+    except Exception:
+        pass
 _BOOT_NOTICE.empty()
 
 if df_db.empty:
@@ -2790,3 +2928,355 @@ if collab_projects:
 
 else:
     st.info("请先在 KOL模块设置 中选择合作项目。")
+
+
+# =========================================================
+# BD decision center（新增：服务立项、资源分配、UP主选择）
+# =========================================================
+def _rank_pct(s: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    x = pd.to_numeric(s, errors="coerce").fillna(0)
+    if len(x) <= 1:
+        return pd.Series([70.0] * len(x), index=s.index)
+    asc = not higher_is_better
+    return x.rank(pct=True, ascending=asc).fillna(0.5) * 100
+
+
+def _project_grade(score: float) -> str:
+    score = _safe_float(score, 0)
+    if score >= 82:
+        return "S 可放量"
+    if score >= 68:
+        return "A 稳定继续"
+    if score >= 54:
+        return "B 小规模验证"
+    if score >= 40:
+        return "C 复盘优化"
+    return "D 暂停谨慎"
+
+
+def _project_action(grade: str) -> str:
+    if grade.startswith("S"):
+        return "优先排期，增加预算/资源位，复制高表现UP与内容结构"
+    if grade.startswith("A"):
+        return "保持合作规模，优先续约表现稳定UP"
+    if grade.startswith("B"):
+        return "小额测试，控制样本，验证题材与UP匹配"
+    if grade.startswith("C"):
+        return "先复盘素材/选题/UP匹配，再决定是否继续"
+    return "暂停放量，仅保留低成本验证或更换合作方向"
+
+
+def _kol_fit_tags(row: pd.Series) -> str:
+    tags = []
+    v = _safe_float(row.get("播放提升值"), np.nan)
+    e = _safe_float(row.get("互动率提升值"), np.nan)
+    d = _safe_float(row.get("深度信号提升值"), np.nan)
+    score = _safe_float(row.get("综合评分"), np.nan)
+    grade = str(row.get("推荐等级", ""))
+    reliability = str(row.get("基准可靠性", ""))
+
+    if not np.isnan(v) and v >= 0.35:
+        tags.append("流量放大型")
+    if not np.isnan(e) and e >= 0.20:
+        tags.append("高互动型")
+    if not np.isnan(d) and d >= 0.15:
+        tags.append("深度沉淀型")
+    if not np.isnan(score) and score >= 60 and reliability in ["高", "中"]:
+        tags.append("稳定交付型")
+    if not np.isnan(v) and v >= 0.35 and not np.isnan(e) and e < -0.15:
+        tags.append("爆发高风险")
+    if grade.startswith("D") or (not np.isnan(e) and e <= -0.30):
+        tags.append("当前项目不适配")
+    if not tags:
+        tags.append("常规观察型")
+    return "、".join(tags)
+
+
+def _build_bd_kol_lib(df_all: pd.DataFrame, bd_projects: list[str]) -> pd.DataFrame:
+    name_map_bd = {}
+    d = df_all[df_all["project"].isin(bd_projects)].copy()
+    if not d.empty:
+        d["owner_mid"] = d["owner_mid"].apply(_norm_mid)
+        name_map_bd = d.groupby("owner_mid")["owner_name"].agg(lambda s: s.value_counts().index[0]).to_dict()
+    lib = _build_kol_compare_lib(
+        df_all_m=df_all,
+        collab_projects=bd_projects,
+        baseline_window_n=baseline_window_n,
+        baseline_min_n=baseline_min_n,
+        name_map=name_map_bd,
+        use_proxy_baseline=True,
+    )
+    if lib is None or lib.empty:
+        return pd.DataFrame()
+    lib = lib.copy()
+    lib["推荐等级"] = lib["推荐等级"].astype(str)
+    lib["适配标签"] = lib.apply(_kol_fit_tags, axis=1)
+    return lib
+
+
+def _build_project_decision_table(df_all: pd.DataFrame, bd_projects: list[str], kol_lib: pd.DataFrame) -> pd.DataFrame:
+    d = df_all[(df_all["project"].isin(bd_projects)) & (df_all["project"] != BASELINE_PROJECT)].copy()
+    if d.empty:
+        return pd.DataFrame()
+    d = compute_metrics(normalize_df(d))
+    overall_er = float(d["engagement_rate"].median()) if not d.empty else 0
+    overall_deep = float(d["deep_signal_ratio"].median()) if not d.empty else 0
+    rows = []
+    for proj, g in d.groupby("project"):
+        g = g.sort_values("view", ascending=False).copy()
+        total_view = int(g["view"].sum())
+        video_cnt = int(len(g))
+        up_cnt = int(g["owner_mid"].apply(_norm_mid).replace("", np.nan).nunique())
+        er_med = float(g["engagement_rate"].median())
+        deep_med = float(g["deep_signal_ratio"].median())
+        top1_share = float(g.iloc[0]["view"] / total_view) if total_view > 0 and not g.empty else 0
+        top3_share = float(g.head(3)["view"].sum() / total_view) if total_view > 0 else 0
+        mids = set(g["owner_mid"].apply(_norm_mid).tolist())
+
+        ksub = kol_lib[kol_lib["owner_mid"].astype(str).isin(mids)].copy() if kol_lib is not None and not kol_lib.empty else pd.DataFrame()
+        kol_cnt = int(len(ksub))
+        ab_cnt = int(ksub["推荐等级"].isin(["A 重点续约", "B 可继续"]).sum()) if not ksub.empty else 0
+        de_cnt = int(ksub["推荐等级"].isin(["D 谨慎投放", "E 无法判断"]).sum()) if not ksub.empty else 0
+        low_reliability = int(ksub["基准可靠性"].isin(["低", "无"]).sum()) if not ksub.empty and "基准可靠性" in ksub.columns else 0
+        ab_rate = ab_cnt / kol_cnt if kol_cnt > 0 else 0
+        de_rate = de_cnt / kol_cnt if kol_cnt > 0 else 0
+
+        risks = []
+        if video_cnt < 3:
+            risks.append("样本不足")
+        if top1_share >= 0.55 or top3_share >= 0.82:
+            risks.append("单点依赖")
+        if er_med < overall_er * 0.75 and total_view > d["view"].median() * max(3, video_cnt):
+            risks.append("高播放低互动")
+        if de_rate >= 0.35:
+            risks.append("KOL匹配风险")
+        if low_reliability >= max(1, kol_cnt * 0.35):
+            risks.append("基准可靠性风险")
+        if not risks:
+            risks.append("暂无明显风险")
+
+        rows.append({
+            "project": proj,
+            "视频数": video_cnt,
+            "UP数": up_cnt,
+            "总播放": total_view,
+            "播放中位数": int(g["view"].median()) if video_cnt else 0,
+            "互动率中位数": er_med,
+            "深度信号中位数": deep_med,
+            "Top1贡献": top1_share,
+            "Top3贡献": top3_share,
+            "KOL数": kol_cnt,
+            "A/B可继续数": ab_cnt,
+            "D/E风险数": de_cnt,
+            "A/B占比": ab_rate,
+            "风险标签": "、".join(risks),
+            "风险数": 0 if risks == ["暂无明显风险"] else len(risks),
+        })
+    out = pd.DataFrame(rows)
+    out["播放规模分"] = _rank_pct(out["总播放"], True)
+    out["互动质量分"] = _rank_pct(out["互动率中位数"], True)
+    out["沉淀质量分"] = _rank_pct(out["深度信号中位数"], True)
+    out["KOL适配分"] = out["A/B占比"].fillna(0) * 100
+    out["结构健康分"] = (100 - (out["Top1贡献"] * 55 + out["Top3贡献"] * 30 + out["风险数"] * 8)).clip(0, 100)
+    out["决策分"] = (
+        out["播放规模分"] * 0.25 +
+        out["互动质量分"] * 0.25 +
+        out["沉淀质量分"] * 0.18 +
+        out["KOL适配分"] * 0.20 +
+        out["结构健康分"] * 0.12
+    ).round(1)
+    out["项目分层"] = out["决策分"].apply(_project_grade)
+    out["资源建议"] = out["项目分层"].apply(_project_action)
+    return out.sort_values(["决策分", "总播放"], ascending=[False, False])
+
+
+def _build_snapshot_compare(df_current: pd.DataFrame, df_snap: pd.DataFrame, bd_projects: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    cur = df_current[(df_current["project"].isin(bd_projects)) & (df_current["project"] != BASELINE_PROJECT)].copy()
+    cur = compute_metrics(normalize_df(cur)) if not cur.empty else cur
+    if cur.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if df_snap is None or df_snap.empty:
+        video_rows = cur.copy()
+        video_rows["首日播放"] = np.nan
+        video_rows["3日播放"] = np.nan
+        video_rows["7日播放"] = np.nan
+        video_rows["首日捕捉"] = "无"
+    else:
+        snap = df_snap[(df_snap["project"].isin(bd_projects)) & (df_snap["project"] != BASELINE_PROJECT)].copy()
+        snap["pubdate"] = pd.to_datetime(snap["pubdate"], errors="coerce")
+        snap["fetched_at"] = pd.to_datetime(snap["fetched_at"], errors="coerce")
+        first_rows = []
+        for (proj, bvid), sg in snap.groupby(["project", "bvid"]):
+            sg = sg.sort_values("fetched_at")
+            pub = sg["pubdate"].dropna().iloc[0] if not sg["pubdate"].dropna().empty else pd.NaT
+            def max_until(days):
+                if pd.isna(pub):
+                    return np.nan
+                pool = sg[(sg["fetched_at"] >= pub) & (sg["fetched_at"] <= pub + pd.Timedelta(days=days))]
+                return float(pool["view"].max()) if not pool.empty else np.nan
+            first_rows.append({
+                "project": proj,
+                "bvid": bvid,
+                "首日播放": max_until(1),
+                "3日播放": max_until(3),
+                "7日播放": max_until(7),
+                "快照数": int(len(sg)),
+            })
+        snap_agg = pd.DataFrame(first_rows)
+        video_rows = cur.merge(snap_agg, on=["project", "bvid"], how="left") if not snap_agg.empty else cur.copy()
+        for c in ["首日播放", "3日播放", "7日播放"]:
+            if c not in video_rows.columns:
+                video_rows[c] = np.nan
+        video_rows["首日捕捉"] = np.where(pd.notna(video_rows["首日播放"]), "有", "无")
+
+    video_rows["累计播放"] = video_rows["view"].astype(float)
+    video_rows["累计/首日倍数"] = np.where(video_rows["首日播放"] > 0, video_rows["累计播放"] / video_rows["首日播放"], np.nan)
+    video_rows["首日占累计"] = np.where(video_rows["累计播放"] > 0, video_rows["首日播放"] / video_rows["累计播放"], np.nan)
+
+    def growth_type(r):
+        if pd.isna(r.get("首日播放")):
+            return "暂无首日快照"
+        share = _safe_float(r.get("首日占累计"), np.nan)
+        if not np.isnan(share) and share >= 0.70:
+            return "首日爆发型"
+        if not np.isnan(share) and share <= 0.35:
+            return "长尾增长型"
+        return "均衡增长型"
+    video_rows["增长类型"] = video_rows.apply(growth_type, axis=1)
+
+    proj_rows = []
+    for proj, g in video_rows.groupby("project"):
+        total_view = float(g["累计播放"].sum())
+        first_sum = float(g["首日播放"].dropna().sum()) if g["首日播放"].notna().any() else np.nan
+        capture_rate = float((g["首日捕捉"] == "有").mean()) if len(g) else 0
+        proj_rows.append({
+            "project": proj,
+            "视频数": int(len(g)),
+            "累计播放": int(total_view),
+            "首日播放合计": int(first_sum) if not np.isnan(first_sum) else 0,
+            "首日捕捉率": capture_rate,
+            "累计/首日倍数": (total_view / first_sum) if first_sum and first_sum > 0 else np.nan,
+            "主增长类型": g["增长类型"].value_counts().index[0] if not g.empty else "",
+        })
+    return video_rows, pd.DataFrame(proj_rows).sort_values("累计播放", ascending=False)
+
+
+def _project_review_text(proj: str, decision_df: pd.DataFrame, kol_lib: pd.DataFrame, video_df: pd.DataFrame) -> str:
+    if decision_df is None or decision_df.empty or proj not in decision_df["project"].astype(str).tolist():
+        return "暂无可生成的复盘内容。"
+    row = decision_df[decision_df["project"] == proj].iloc[0]
+    vsub = video_df[video_df["project"] == proj].copy() if video_df is not None and not video_df.empty else pd.DataFrame()
+    top_video = vsub.sort_values("累计播放", ascending=False).head(1).iloc[0] if not vsub.empty else None
+    mids = set(vsub["owner_mid"].apply(_norm_mid).tolist()) if not vsub.empty and "owner_mid" in vsub.columns else set()
+    ksub = kol_lib[kol_lib["owner_mid"].astype(str).isin(mids)].copy() if kol_lib is not None and not kol_lib.empty else pd.DataFrame()
+    good = ksub[ksub["推荐等级"].isin(["A 重点续约", "B 可继续"])].sort_values("综合评分", ascending=False)["KOL/UP主"].head(5).tolist() if not ksub.empty else []
+    risk = ksub[ksub["推荐等级"].isin(["D 谨慎投放", "E 无法判断"])].sort_values("综合评分", ascending=True)["KOL/UP主"].head(5).tolist() if not ksub.empty else []
+    top_line = f"最高播放视频为《{top_video['title']}》，累计 {int(top_video['累计播放']):,} 播放，增长类型：{top_video['增长类型']}。" if top_video is not None else "暂无视频明细。"
+    return "\n".join([
+        f"项目【{proj}】当前分层为 {row['项目分层']}，决策分 {row['决策分']}，建议：{row['资源建议']}。",
+        f"核心数据：{int(row['视频数'])} 条视频 / {int(row['UP数'])} 位UP，累计播放 {int(row['总播放']):,}，互动率中位数 {row['互动率中位数']*100:.2f}%，深度信号中位数 {row['深度信号中位数']*100:.1f}%。",
+        top_line,
+        f"推荐优先合作UP：{'、'.join(good) if good else '暂无明确A/B名单'}。",
+        f"谨慎或需补充判断UP：{'、'.join(risk) if risk else '暂无明显风险名单'}。",
+        f"风险提示：{row['风险标签']}。",
+        "下一步动作：优先复用高表现UP与内容结构；对风险UP降低预算或更换选题；继续积累首日/3日/7日快照，用于判断内容起量速度与长尾能力。",
+    ])
+
+
+st.divider()
+st.subheader("BD项目决策辅助中心")
+bd_default_projects = collab_projects if "collab_projects" in globals() and collab_projects else (sel_projects if sel_projects else projects)
+bd_projects = st.multiselect("BD决策分析项目范围", projects, default=bd_default_projects, key="bd_decision_projects")
+
+if not bd_projects:
+    st.info("请选择至少一个项目用于BD决策分析。")
+else:
+    with st.spinner("正在生成BD决策分析..."):
+        bd_kol_lib = _build_bd_kol_lib(df_db, bd_projects)
+        bd_project_decision = _build_project_decision_table(df_db, bd_projects, bd_kol_lib)
+        bd_snapshots = load_snapshots()
+        bd_video_growth, bd_project_growth = _build_snapshot_compare(df_db, bd_snapshots, bd_projects)
+
+    tab_bd1, tab_bd2, tab_bd3, tab_bd4, tab_bd5 = st.tabs([
+        "项目分层", "KOL适配标签", "首日/累计表现", "风险状态", "复盘模板"
+    ])
+
+    with tab_bd1:
+        st.markdown("**项目分层总览（服务立项与资源分配）**")
+        if bd_project_decision.empty:
+            st.info("暂无项目分层数据。")
+        else:
+            show = bd_project_decision.copy()
+            for c in ["互动率中位数", "深度信号中位数", "Top1贡献", "Top3贡献", "A/B占比"]:
+                show[c] = (show[c] * 100).map(lambda x: f"{x:.1f}%")
+            st.dataframe(show[[
+                "project", "项目分层", "决策分", "资源建议", "视频数", "UP数", "总播放",
+                "互动率中位数", "深度信号中位数", "Top1贡献", "Top3贡献", "A/B可继续数", "D/E风险数", "风险标签"
+            ]], use_container_width=True, height=420)
+            st.download_button(
+                "下载项目分层CSV",
+                data=bd_project_decision.to_csv(index=False).encode("utf-8-sig"),
+                file_name="bd_project_decision.csv",
+                mime="text/csv",
+            )
+
+    with tab_bd2:
+        st.markdown("**KOL适配标签库（服务UP主选择）**")
+        if bd_kol_lib.empty:
+            st.info("暂无KOL适配标签。请先补齐KOL基准。")
+        else:
+            show = bd_kol_lib.copy()
+            if "综合评分" in show.columns:
+                show["综合评分"] = pd.to_numeric(show["综合评分"], errors="coerce").round(1)
+            display = [
+                "owner_mid", "KOL/UP主", "推荐等级", "综合评分", "适配标签", "基准类型", "基准可靠性",
+                "播放提升", "互动率提升", "深度信号提升", "合作播放中位数", "基准播放中位数"
+            ]
+            st.dataframe(show[[c for c in display if c in show.columns]], use_container_width=True, height=520)
+            st.download_button(
+                "下载KOL适配标签CSV",
+                data=show.to_csv(index=False).encode("utf-8-sig"),
+                file_name="bd_kol_fit_tags.csv",
+                mime="text/csv",
+            )
+
+    with tab_bd3:
+        st.markdown("**首日 / 3日 / 7日 / 累计表现对比**")
+        st.caption("说明：首日/3日/7日依赖快照表。从这版开始自动积累；过去没有快照的数据不会伪造。")
+        if bd_project_growth.empty:
+            st.info("暂无快照对比数据。当前版本上线后，每次采集/导入/补齐会自动记录快照。")
+        else:
+            show_proj = bd_project_growth.copy()
+            show_proj["首日捕捉率"] = (show_proj["首日捕捉率"] * 100).map(lambda x: f"{x:.1f}%")
+            show_proj["累计/首日倍数"] = show_proj["累计/首日倍数"].map(lambda x: "-" if pd.isna(x) else f"{x:.2f}x")
+            st.dataframe(show_proj, use_container_width=True, height=260)
+            show_video = bd_video_growth.copy()
+            for c in ["首日播放", "3日播放", "7日播放", "累计播放"]:
+                show_video[c] = pd.to_numeric(show_video[c], errors="coerce")
+            show_cols = [
+                "project", "bvid", "title", "owner_name", "pubdate", "首日捕捉",
+                "首日播放", "3日播放", "7日播放", "累计播放", "累计/首日倍数", "增长类型"
+            ]
+            st.dataframe(show_video[[c for c in show_cols if c in show_video.columns]].sort_values("累计播放", ascending=False), use_container_width=True, height=480)
+
+    with tab_bd4:
+        st.markdown("**风险状态提示**")
+        if bd_project_decision.empty:
+            st.info("暂无风险数据。")
+        else:
+            risk_df = bd_project_decision[["project", "项目分层", "风险标签", "风险数", "Top1贡献", "Top3贡献", "D/E风险数", "资源建议"]].copy()
+            risk_df["Top1贡献"] = (risk_df["Top1贡献"] * 100).map(lambda x: f"{x:.1f}%")
+            risk_df["Top3贡献"] = (risk_df["Top3贡献"] * 100).map(lambda x: f"{x:.1f}%")
+            st.dataframe(risk_df.sort_values(["风险数", "D/E风险数"], ascending=False), use_container_width=True, height=360)
+
+    with tab_bd5:
+        st.markdown("**一键复盘模板**")
+        if bd_project_decision.empty:
+            st.info("暂无可生成复盘的项目。")
+        else:
+            review_project = st.selectbox("选择要生成复盘的项目", bd_project_decision["project"].tolist(), key="bd_review_project")
+            st.text_area(
+                "复盘文案",
+                value=_project_review_text(review_project, bd_project_decision, bd_kol_lib, bd_video_growth),
+                height=260,
+            )
