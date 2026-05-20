@@ -15,6 +15,8 @@ import streamlit as st
 import plotly.express as px
 
 st.set_page_config(page_title="B站运营数据Dashboard", layout="wide")
+_BOOT_NOTICE = st.empty()
+_BOOT_NOTICE.info("应用正在启动，请稍等。如果长时间停在这里，通常是数据库/备份文件过大或云端正在重启。")
 
 # =========================
 # Constants
@@ -96,4 +98,3 @@ def _try_restore_from_backup() -> bool:
     返回是否恢复成功
     """
     if not os.path.exists(BACKUP_LATEST_CSV):
-        return False
