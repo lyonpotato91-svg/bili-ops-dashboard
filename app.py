@@ -3183,6 +3183,196 @@ def _project_review_text(proj: str, decision_df: pd.DataFrame, kol_lib: pd.DataF
     ])
 
 
+BD_GRADE_ORDER = ["S 可放量", "A 稳定继续", "B 小规模验证", "C 复盘优化", "D 暂停谨慎"]
+BD_GRADE_COLORS = {
+    "S 可放量": "#009E73",
+    "A 稳定继续": "#0072B2",
+    "B 小规模验证": "#E69F00",
+    "C 复盘优化": "#D55E00",
+    "D 暂停谨慎": "#7F7F7F",
+}
+BD_RISK_LABELS = ["样本不足", "单点依赖", "高播放低互动", "KOL匹配风险", "基准可靠性风险"]
+
+
+def _split_tag_counts(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    rows = []
+    if df is None or df.empty or col not in df.columns:
+        return pd.DataFrame(columns=["标签", "数量"])
+    for v in df[col].dropna().astype(str).tolist():
+        for tag in [x.strip() for x in v.split("、") if x.strip()]:
+            rows.append(tag)
+    if not rows:
+        return pd.DataFrame(columns=["标签", "数量"])
+    return pd.Series(rows).value_counts().rename_axis("标签").reset_index(name="数量")
+
+
+def _render_bd_visuals(decision_df: pd.DataFrame, kol_lib: pd.DataFrame, video_growth: pd.DataFrame, project_growth: pd.DataFrame):
+    if decision_df is None or decision_df.empty:
+        st.info("暂无可视化数据。")
+        return
+
+    d = decision_df.copy()
+    d["项目分层"] = pd.Categorical(d["项目分层"].astype(str), categories=BD_GRADE_ORDER, ordered=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("项目数", f"{len(d):,}")
+    c2.metric("S/A项目", f"{int(d['项目分层'].astype(str).isin(['S 可放量', 'A 稳定继续']).sum()):,}")
+    c3.metric("风险项目", f"{int((d['风险数'] > 0).sum()):,}")
+    c4.metric("总播放", f"{int(d['总播放'].sum()):,}")
+
+    st.markdown("**项目决策矩阵（X=互动质量，Y=KOL适配，气泡=总播放）**")
+    fig_matrix = px.scatter(
+        d,
+        x="互动质量分",
+        y="KOL适配分",
+        size="总播放",
+        color="项目分层",
+        color_discrete_map=BD_GRADE_COLORS,
+        category_orders={"项目分层": BD_GRADE_ORDER},
+        text="project",
+        hover_data={
+            "决策分": ":.1f",
+            "总播放": True,
+            "风险标签": True,
+            "Top1贡献": ":.1%",
+            "Top3贡献": ":.1%",
+            "互动质量分": ":.1f",
+            "KOL适配分": ":.1f",
+        },
+        height=560,
+    )
+    fig_matrix.add_vline(x=float(d["互动质量分"].median()), line_dash="dash", line_color="#666")
+    fig_matrix.add_hline(y=float(d["KOL适配分"].median()), line_dash="dash", line_color="#666")
+    fig_matrix.update_traces(textposition="top center", marker=dict(opacity=0.78, line=dict(width=1, color="white")))
+    fig_matrix.update_layout(xaxis_title="互动质量分", yaxis_title="KOL适配分", legend_title_text="项目分层")
+    st.plotly_chart(fig_matrix, use_container_width=True)
+
+    left, right = st.columns([1.1, 1])
+    with left:
+        st.markdown("**项目决策分排行**")
+        rank = d.sort_values("决策分", ascending=True)
+        fig_rank = px.bar(
+            rank,
+            x="决策分",
+            y="project",
+            orientation="h",
+            color="项目分层",
+            color_discrete_map=BD_GRADE_COLORS,
+            category_orders={"项目分层": BD_GRADE_ORDER},
+            text="决策分",
+            hover_data=["资源建议", "风险标签", "总播放"],
+            height=max(380, min(760, 34 * len(rank) + 120)),
+        )
+        fig_rank.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+        fig_rank.update_layout(xaxis_range=[0, 105], yaxis_title="项目", legend_title_text="项目分层")
+        st.plotly_chart(fig_rank, use_container_width=True)
+
+    with right:
+        st.markdown("**项目分层占比**")
+        grade_count = d["项目分层"].astype(str).value_counts().reindex(BD_GRADE_ORDER).dropna().reset_index()
+        grade_count.columns = ["项目分层", "数量"]
+        fig_pie = px.pie(
+            grade_count,
+            names="项目分层",
+            values="数量",
+            color="项目分层",
+            color_discrete_map=BD_GRADE_COLORS,
+            hole=0.46,
+            height=380,
+        )
+        fig_pie.update_layout(legend_title_text="项目分层")
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.markdown("**风险热力图（1=命中风险）**")
+    risk_rows = []
+    for _, r in d.iterrows():
+        hit = set(str(r.get("风险标签", "")).split("、"))
+        row = {"project": r["project"]}
+        for label in BD_RISK_LABELS:
+            row[label] = 1 if label in hit else 0
+        risk_rows.append(row)
+    risk_df = pd.DataFrame(risk_rows)
+    if not risk_df.empty:
+        z = risk_df[BD_RISK_LABELS].to_numpy()
+        fig_risk = px.imshow(
+            z,
+            x=BD_RISK_LABELS,
+            y=risk_df["project"],
+            color_continuous_scale=["#F6F8FA", "#D55E00"],
+            aspect="auto",
+            height=max(320, min(720, 30 * len(risk_df) + 140)),
+        )
+        fig_risk.update_traces(text=z, texttemplate="%{text}")
+        fig_risk.update_layout(coloraxis_showscale=False, xaxis_title="风险类型", yaxis_title="项目")
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.markdown("**KOL适配标签分布**")
+        tag_count = _split_tag_counts(kol_lib, "适配标签")
+        if tag_count.empty:
+            st.info("暂无KOL标签数据。")
+        else:
+            fig_tags = px.bar(
+                tag_count.sort_values("数量", ascending=True),
+                x="数量",
+                y="标签",
+                orientation="h",
+                text="数量",
+                height=max(360, min(680, 34 * len(tag_count) + 120)),
+                color="标签",
+            )
+            fig_tags.update_traces(textposition="outside", showlegend=False)
+            fig_tags.update_layout(yaxis_title="适配标签", xaxis_title="KOL数量")
+            st.plotly_chart(fig_tags, use_container_width=True)
+
+    with c_right:
+        st.markdown("**首日/累计增长类型分布**")
+        if video_growth is None or video_growth.empty or "增长类型" not in video_growth.columns:
+            st.info("暂无增长类型数据。")
+        else:
+            grow_count = video_growth["增长类型"].astype(str).value_counts().reset_index()
+            grow_count.columns = ["增长类型", "视频数"]
+            fig_growth_bar = px.bar(
+                grow_count,
+                x="增长类型",
+                y="视频数",
+                color="增长类型",
+                text="视频数",
+                height=360,
+            )
+            fig_growth_bar.update_traces(textposition="outside", showlegend=False)
+            fig_growth_bar.update_layout(xaxis_title="增长类型", yaxis_title="视频数")
+            st.plotly_chart(fig_growth_bar, use_container_width=True)
+
+    st.markdown("**视频增长散点（有首日快照时：X=首日播放，Y=累计播放）**")
+    if video_growth is None or video_growth.empty:
+        st.info("暂无视频增长数据。")
+    else:
+        vg = video_growth.copy()
+        vg["首日播放"] = pd.to_numeric(vg.get("首日播放", np.nan), errors="coerce")
+        vg["累计播放"] = pd.to_numeric(vg.get("累计播放", np.nan), errors="coerce")
+        plot_vg = vg.dropna(subset=["首日播放", "累计播放"]).copy()
+        plot_vg = plot_vg[(plot_vg["首日播放"] > 0) & (plot_vg["累计播放"] > 0)].copy()
+        if plot_vg.empty:
+            st.info("当前还没有首日快照。上线后持续采集几次，散点图会自动出现。")
+        else:
+            fig_video = px.scatter(
+                plot_vg,
+                x="首日播放",
+                y="累计播放",
+                color="增长类型",
+                size="累计播放",
+                hover_name="title",
+                hover_data=["project", "owner_name", "bvid", "累计/首日倍数"],
+                log_x=True,
+                log_y=True,
+                height=560,
+            )
+            fig_video.update_layout(xaxis_title="首日播放（log）", yaxis_title="累计播放（log）")
+            st.plotly_chart(fig_video, use_container_width=True)
+
+
 st.divider()
 st.subheader("BD项目决策辅助中心")
 bd_default_projects = collab_projects if "collab_projects" in globals() and collab_projects else (sel_projects if sel_projects else projects)
@@ -3197,9 +3387,12 @@ else:
         bd_snapshots = load_snapshots()
         bd_video_growth, bd_project_growth = _build_snapshot_compare(df_db, bd_snapshots, bd_projects)
 
-    tab_bd1, tab_bd2, tab_bd3, tab_bd4, tab_bd5 = st.tabs([
-        "项目分层", "KOL适配标签", "首日/累计表现", "风险状态", "复盘模板"
+    tab_bd0, tab_bd1, tab_bd2, tab_bd3, tab_bd4, tab_bd5 = st.tabs([
+        "可视化总览", "项目分层", "KOL适配标签", "首日/累计表现", "风险状态", "复盘模板"
     ])
+
+    with tab_bd0:
+        _render_bd_visuals(bd_project_decision, bd_kol_lib, bd_video_growth, bd_project_growth)
 
     with tab_bd1:
         st.markdown("**项目分层总览（服务立项与资源分配）**")
