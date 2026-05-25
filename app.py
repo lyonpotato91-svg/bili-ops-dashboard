@@ -1620,6 +1620,28 @@ def _fetch_vlist_by_owner_search(
                     continue
                 seen.add(bvid)
                 checked += 1
+
+                item_mid = _norm_mid(item.get("mid") or item.get("owner_mid") or item.get("author_mid") or "")
+                if item_mid and item_mid == _norm_mid(mid):
+                    row = _as_video_row(item) or {}
+                    rows.append({
+                        "bvid": bvid,
+                        "title": row.get("title") or _clean_bili_title(item.get("title", "")),
+                        "pubdate": row.get("pubdate", pd.to_datetime(item.get("pubdate", pd.NaT), unit="s", errors="coerce")),
+                        "view": _safe_int(row.get("view", _bili_num_to_int(item.get("play", 0)))),
+                        "reply": _safe_int(row.get("reply", _bili_num_to_int(item.get("review", item.get("comment", 0))))),
+                        "like": _safe_int(row.get("like", 0)),
+                        "coin": _safe_int(row.get("coin", 0)),
+                        "favorite": _safe_int(row.get("favorite", _bili_num_to_int(item.get("favorites", 0)))),
+                        "danmaku": _safe_int(row.get("danmaku", _bili_num_to_int(item.get("video_review", 0)))),
+                        "share": _safe_int(row.get("share", 0)),
+                    })
+                    matched += 1
+                    if len(rows) >= n:
+                        break
+                    _sleep_jitter(0.12)
+                    continue
+
                 detail = fetch_video_detail_by_bvid(bvid, sess=sess, cookie=cookie, proxy=proxy)
                 if detail is not None and _norm_mid(detail.get("owner_mid", "")) == _norm_mid(mid):
                     rows.append({
@@ -2613,13 +2635,15 @@ with st.expander("KOL模块设置", expanded=False):
         help="浏览器开VPN不等于 Python requests 也走VPN；本地运行时可填代理地址。"
     )
 
-cA, cB, cC = st.columns([1, 1, 2])
+cA, cB, cC, cD = st.columns([1, 1, 1, 2])
 with cA:
     btn_fill_all = st.button("🧲 一键补齐所有合作KOL基准（写入__BASELINE__）")
 with cB:
-    btn_build_kol = st.button("📚 生成KOL对比表（含视觉总览）")
+    btn_fill_zero = st.button("⚡ 只补齐0样本KOL（新项目推荐）")
 with cC:
-    st.caption("本版关键：抓取链路完整跑完；视觉层统一 ABCDE 分级与颜色。")
+    btn_build_kol = st.button("📚 生成KOL对比表（含视觉总览）")
+with cD:
+    st.caption("新项目导入后：优先点“只补齐0样本KOL”；仍为0时再填Cookie重试。")
 
 if collab_projects:
     collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
@@ -2645,7 +2669,17 @@ if collab_projects:
     name_map = (valid_mid_df.groupby("owner_mid")["owner_name"]
                 .agg(lambda s: s.value_counts().index[0]).to_dict()) if not valid_mid_df.empty else {}
 
-    if btn_fill_all:
+    if not valid_mid_df.empty:
+        _collab_bvids_preview = set(valid_mid_df["bvid"].astype(str).tolist())
+        _zero_mids_preview = []
+        for _mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
+            _existing_preview = _existing_personal_base_pool(df_db, _mid, collab_projects, _collab_bvids_preview)
+            if len(_existing_preview) == 0:
+                _zero_mids_preview.append(_mid)
+        if _zero_mids_preview:
+            st.warning(f"当前有 {len(_zero_mids_preview)} 个KOL没有个人历史基准。新项目导入后这是正常状态，建议先点击“只补齐0样本KOL”。")
+
+    if btn_fill_all or btn_fill_zero:
         progress = st.progress(0)
         status = st.empty()
         debug_rows = []
@@ -2715,6 +2749,9 @@ if collab_projects:
         mid_need_rows = []
         for mid in mids_all:
             existing_pool = _existing_personal_base_pool(df_db_work, mid, collab_projects, collab_bvids_all)
+            if bool(btn_fill_zero) and len(existing_pool) > 0:
+                stat["mid_skipped_enough"] += 1
+                continue
             if bool(skip_enough_baseline) and len(existing_pool) >= int(baseline_min_n):
                 stat["mid_skipped_enough"] += 1
                 continue
