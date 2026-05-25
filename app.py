@@ -2616,6 +2616,30 @@ st.subheader("KOL合作资料库（独立模块：标注合作是否优于平时
 
 with st.expander("KOL模块设置", expanded=False):
     collab_projects = st.multiselect("哪些项目算合作项目", projects, default=sel_projects if sel_projects else projects)
+    _candidate_target_projects = list(collab_projects or [])
+    _sidebar_target_projects = [p for p in (sel_projects if sel_projects else []) if p in _candidate_target_projects]
+    if _sidebar_target_projects and len(_sidebar_target_projects) < len(projects):
+        _default_target_projects = _sidebar_target_projects
+    else:
+        _default_target_projects = []
+        try:
+            _pdate = df_db[df_db["project"].isin(_candidate_target_projects)].copy()
+            _pdate["pubdate"] = pd.to_datetime(_pdate["pubdate"], errors="coerce")
+            _pdate = _pdate.dropna(subset=["pubdate"])
+            if not _pdate.empty:
+                _latest_project = str(_pdate.sort_values("pubdate").iloc[-1]["project"])
+                if _latest_project in _candidate_target_projects:
+                    _default_target_projects = [_latest_project]
+        except Exception:
+            _default_target_projects = []
+        if not _default_target_projects and _candidate_target_projects:
+            _default_target_projects = [_candidate_target_projects[-1]]
+    target_projects = st.multiselect(
+        "当前要评估/立项的项目（只排除这些项目；旧合作项目会作为历史参考）",
+        _candidate_target_projects,
+        default=_default_target_projects,
+        help="例如现在看“刺客信条-黑旗重置”，这里只选它。旧项目不要选到这里，否则旧合作视频也会被排除出个人基准。"
+    )
     fetch_n = st.slider("补齐基准：每个KOL抓取最近N条公开视频", 10, 80, 30, step=5)
     skip_enough_baseline = st.checkbox("补齐时跳过已达最低样本数的KOL（推荐，避免云端超时）", value=True)
     max_mids_per_run = st.slider("本次最多处理不足KOL数（可重复点击继续补齐）", 5, 80, 20, step=5)
@@ -2646,7 +2670,17 @@ with cD:
     st.caption("新项目导入后：优先点“只补齐0样本KOL”；仍为0时再填Cookie重试。")
 
 if collab_projects:
-    collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
+    active_projects = list(target_projects) if target_projects else list(collab_projects)
+    if target_projects and set(active_projects) != set(collab_projects):
+        st.info(
+            "当前KOL评估只针对："
+            + "、".join(active_projects)
+            + "。其他已选合作项目会作为历史参考参与个人基准。"
+        )
+    elif len(collab_projects) > 1:
+        st.warning("当前没有单独指定评估项目，系统会把所有合作项目都当作当前项目；旧合作视频不会计入个人基准。建议在设置里只选择本次要评估的项目。")
+
+    collab_df = df_db[df_db["project"].isin(active_projects)].copy()
     collab_df["owner_mid"] = collab_df["owner_mid"].apply(_norm_mid)
 
     valid_mid_df = collab_df[collab_df["owner_mid"].astype(str).str.len() > 0].copy()
@@ -2673,7 +2707,7 @@ if collab_projects:
         _collab_bvids_preview = set(valid_mid_df["bvid"].astype(str).tolist())
         _zero_mids_preview = []
         for _mid in sorted(valid_mid_df["owner_mid"].unique().tolist()):
-            _existing_preview = _existing_personal_base_pool(df_db, _mid, collab_projects, _collab_bvids_preview)
+            _existing_preview = _existing_personal_base_pool(df_db, _mid, active_projects, _collab_bvids_preview)
             if len(_existing_preview) == 0:
                 _zero_mids_preview.append(_mid)
         if _zero_mids_preview:
@@ -2734,7 +2768,7 @@ if collab_projects:
             df_db_work = df_db.copy()
 
         # 用修复后的 owner_mid 重新计算合作KOL
-        collab_df_work = df_db_work[df_db_work["project"].isin(collab_projects)].copy()
+        collab_df_work = df_db_work[df_db_work["project"].isin(active_projects)].copy()
         collab_df_work["owner_mid"] = collab_df_work["owner_mid"].apply(_norm_mid)
         valid_mid_df_work = collab_df_work[collab_df_work["owner_mid"].astype(str).str.len() > 0].copy()
         name_map_work = (valid_mid_df_work.groupby("owner_mid")["owner_name"]
@@ -2748,7 +2782,7 @@ if collab_projects:
         mids_all = sorted(valid_mid_df_work["owner_mid"].unique().tolist())
         mid_need_rows = []
         for mid in mids_all:
-            existing_pool = _existing_personal_base_pool(df_db_work, mid, collab_projects, collab_bvids_all)
+            existing_pool = _existing_personal_base_pool(df_db_work, mid, active_projects, collab_bvids_all)
             if bool(btn_fill_zero) and len(existing_pool) > 0:
                 stat["mid_skipped_enough"] += 1
                 continue
@@ -2800,7 +2834,7 @@ if collab_projects:
                     stat["list_empty"] += 1
                     continue
 
-                existing_bvids_this_mid = set(_existing_personal_base_pool(df_db_work, mid, collab_projects, collab_bvids_all)["bvid"].astype(str).tolist())
+                existing_bvids_this_mid = set(_existing_personal_base_pool(df_db_work, mid, active_projects, collab_bvids_all)["bvid"].astype(str).tolist())
                 for v in vlist:
                     bvid = v.get("bvid", "")
                     if not bvid or bvid in collab_bvids_all:
@@ -2896,7 +2930,7 @@ if collab_projects:
         )
         base_pool = owner_all[
             (owner_all["project"] == BASELINE_PROJECT) |
-            (~owner_all["project"].isin(set(collab_projects)))
+            (~owner_all["project"].isin(set(active_projects)))
         ].copy()
         base_pool = base_pool[~base_pool["bvid"].astype(str).isin(collab_bvids_this_mid)]
         base_pool = base_pool[base_pool["view"].astype(float) > 0]
@@ -2933,7 +2967,7 @@ if collab_projects:
         df_all_m = normalize_df(load_all_rows())
         lib = _build_kol_compare_lib(
             df_all_m=df_all_m,
-            collab_projects=collab_projects,
+            collab_projects=active_projects,
             baseline_window_n=baseline_window_n,
             baseline_min_n=baseline_min_n,
             name_map=name_map,
