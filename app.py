@@ -1869,7 +1869,7 @@ st.sidebar.divider()
 # =========================
 # Data input
 # =========================
-mode = st.sidebar.radio("数据来源", ["粘贴链接/BV采集", "上传CSV导入"], index=0)
+mode = st.sidebar.radio("数据来源", ["粘贴链接/BV采集", "上传CSV/Excel导入"], index=0)
 
 if mode == "粘贴链接/BV采集":
     project = st.sidebar.text_input("项目名（用于归档）", value="未命名项目")
@@ -1910,27 +1910,46 @@ if mode == "粘贴链接/BV采集":
 
 else:
     default_project = st.sidebar.text_input("缺少 project 列时：默认项目名", value="未命名项目")
-    uploaded = st.sidebar.file_uploader("选择CSV文件", type=["csv"])
-    import_btn = st.sidebar.button("📥 导入CSV到仪表盘（会永久保存）")
+    uploaded = st.sidebar.file_uploader("选择CSV或Excel文件", type=["csv", "xlsx"])
+    import_btn = st.sidebar.button("📥 导入CSV/Excel到仪表盘（会永久保存）")
 
     if import_btn:
         if not uploaded:
-            st.sidebar.error("请先选择一个CSV文件。")
+            st.sidebar.error("请先选择一个CSV或Excel文件。")
         else:
             raw = uploaded.getvalue()
-            df_csv = None
-            for enc in ["utf-8-sig", "utf-8", "gbk"]:
+            df_import_raw = None
+            file_name = getattr(uploaded, "name", "").lower()
+            if file_name.endswith(".xlsx"):
                 try:
-                    df_csv = pd.read_csv(io.BytesIO(raw), encoding=enc)
-                    break
-                except Exception:
-                    df_csv = None
-
-            if df_csv is None:
-                st.sidebar.error("CSV读取失败：建议UTF-8编码。")
+                    sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None)
+                    frames = []
+                    for sheet_name, sheet_df in sheets.items():
+                        if sheet_df is None or sheet_df.empty:
+                            continue
+                        sheet_df = sheet_df.copy()
+                        sheet_df.columns = [str(c).strip() for c in sheet_df.columns]
+                        has_project_col = any(str(c).strip().lower() in ["project", "项目", "项目名"] for c in sheet_df.columns)
+                        if not has_project_col:
+                            sheet_df["project"] = str(sheet_name)
+                        frames.append(sheet_df)
+                    df_import_raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                except Exception as e:
+                    st.sidebar.error(f"Excel读取失败：{e}")
+                    df_import_raw = None
             else:
-                raw_import_count = len(df_csv)
-                df_csv = normalize_df(df_csv)
+                for enc in ["utf-8-sig", "utf-8", "gbk"]:
+                    try:
+                        df_import_raw = pd.read_csv(io.BytesIO(raw), encoding=enc)
+                        break
+                    except Exception:
+                        df_import_raw = None
+
+            if df_import_raw is None:
+                st.sidebar.error("文件读取失败：CSV建议UTF-8编码；Excel建议使用 .xlsx。")
+            else:
+                raw_import_count = len(df_import_raw)
+                df_csv = normalize_df(df_import_raw)
                 dropped_import_count = max(0, raw_import_count - len(df_csv))
                 if "project" not in df_csv.columns:
                     df_csv["project"] = default_project
@@ -2311,6 +2330,7 @@ def _build_kol_compare_lib(
     baseline_min_n: int,
     name_map: dict | None = None,
     use_proxy_baseline: bool = True,
+    baseline_exclude_projects: list[str] | None = None,
 ) -> pd.DataFrame:
     """生成 KOL 对比库。优先使用 KOL 自身历史；自身历史为0时可用平台替代基准，并明确标注。"""
     if df_all_m is None or df_all_m.empty:
@@ -2318,6 +2338,7 @@ def _build_kol_compare_lib(
     df_all_m = compute_metrics(normalize_df(df_all_m.copy()))
     df_all_m["owner_mid"] = df_all_m["owner_mid"].apply(_norm_mid)
     collab_set = set(collab_projects or [])
+    baseline_exclude_set = set(baseline_exclude_projects if baseline_exclude_projects is not None else (collab_projects or []))
     name_map = name_map or {}
 
     collab_mid_df = df_all_m[df_all_m["project"].isin(collab_set)].copy()
@@ -2325,7 +2346,7 @@ def _build_kol_compare_lib(
     if collab_mid_df.empty:
         return pd.DataFrame()
 
-    proxy_pool = df_all_m[(~df_all_m["project"].isin(collab_set)) | (df_all_m["project"] == BASELINE_PROJECT)].copy()
+    proxy_pool = df_all_m[(~df_all_m["project"].isin(baseline_exclude_set)) | (df_all_m["project"] == BASELINE_PROJECT)].copy()
     proxy_pool = proxy_pool[proxy_pool["view"].astype(float) > 0]
     proxy_pool = proxy_pool.drop_duplicates(subset=["owner_mid", "bvid"], keep="last")
     proxy_pool = _sort_owner_hist(proxy_pool).head(max(120, baseline_window_n * 20)) if not proxy_pool.empty else proxy_pool
@@ -2341,7 +2362,7 @@ def _build_kol_compare_lib(
         owner_all = _sort_owner_hist(owner_all)
         collab_bvids = set(g_collab["bvid"].astype(str).tolist())
 
-        own_base = owner_all[(~owner_all["project"].isin(collab_set)) | (owner_all["project"] == BASELINE_PROJECT)].copy()
+        own_base = owner_all[(~owner_all["project"].isin(baseline_exclude_set)) | (owner_all["project"] == BASELINE_PROJECT)].copy()
         own_base = own_base[~own_base["bvid"].astype(str).isin(collab_bvids)]
         own_base = own_base[own_base["view"].astype(float) > 0]
         own_base = own_base.drop_duplicates(subset=["bvid"], keep="last")
@@ -2640,6 +2661,13 @@ with st.expander("KOL模块设置", expanded=False):
         default=_default_target_projects,
         help="例如现在看“刺客信条-黑旗重置”，这里只选它。旧项目不要选到这里，否则旧合作视频也会被排除出个人基准。"
     )
+    kol_view_scope = st.radio(
+        "KOL视觉总览/对比表统计范围",
+        ["当前评估项目", "全部合作KOL库"],
+        index=0,
+        horizontal=True,
+        help="当前评估项目用于本次立项/投放决策；全部合作KOL库用于盘点所有历史合作UP主数量。"
+    )
     fetch_n = st.slider("补齐基准：每个KOL抓取最近N条公开视频", 10, 80, 30, step=5)
     skip_enough_baseline = st.checkbox("补齐时跳过已达最低样本数的KOL（推荐，避免云端超时）", value=True)
     max_mids_per_run = st.slider("本次最多处理不足KOL数（可重复点击继续补齐）", 5, 80, 20, step=5)
@@ -2685,12 +2713,23 @@ if collab_projects:
 
     valid_mid_df = collab_df[collab_df["owner_mid"].astype(str).str.len() > 0].copy()
     invalid_mid_cnt = int((collab_df["owner_mid"].astype(str).str.len() == 0).sum())
+    all_collab_df = df_db[df_db["project"].isin(collab_projects)].copy()
+    all_collab_df["owner_mid"] = all_collab_df["owner_mid"].apply(_norm_mid)
+    all_valid_mid_df = all_collab_df[all_collab_df["owner_mid"].astype(str).str.len() > 0].copy()
+    all_invalid_mid_cnt = int((all_collab_df["owner_mid"].astype(str).str.len() == 0).sum())
 
     st.caption(
         f"合作UP主数：{valid_mid_df['owner_mid'].nunique()}（可识别mid）"
         f"｜缺/异常mid合作视频：{invalid_mid_cnt}"
         f"｜合作视频数：{len(collab_df)}"
     )
+    inv_cols = st.columns(4)
+    inv_cols[0].metric("当前评估项目KOL", f"{valid_mid_df['owner_mid'].nunique():,}")
+    inv_cols[1].metric("全部合作KOL库", f"{all_valid_mid_df['owner_mid'].nunique():,}")
+    inv_cols[2].metric("当前项目视频数", f"{len(collab_df):,}")
+    inv_cols[3].metric("全库缺/异常mid视频", f"{all_invalid_mid_cnt:,}")
+    if kol_view_scope == "当前评估项目" and all_valid_mid_df["owner_mid"].nunique() > valid_mid_df["owner_mid"].nunique():
+        st.caption("提示：当前页的视觉总览默认只看本次评估项目；如需盘点全部历史合作UP主，请在设置里把统计范围切到“全部合作KOL库”。")
 
     if show_kol_quality_hint:
         bad_rows = collab_df[collab_df["owner_mid"].astype(str).str.len() == 0].copy()
@@ -2965,17 +3004,29 @@ if collab_projects:
 
     if btn_build_kol:
         df_all_m = normalize_df(load_all_rows())
+        analysis_projects = active_projects if kol_view_scope == "当前评估项目" else list(collab_projects)
+        baseline_exclude_projects = active_projects if kol_view_scope == "当前评估项目" else list(collab_projects)
+        analysis_df_for_name = df_db[df_db["project"].isin(analysis_projects)].copy()
+        analysis_df_for_name["owner_mid"] = analysis_df_for_name["owner_mid"].apply(_norm_mid)
+        analysis_name_map = (
+            analysis_df_for_name[analysis_df_for_name["owner_mid"].astype(str).str.len() > 0]
+            .groupby("owner_mid")["owner_name"]
+            .agg(lambda s: s.value_counts().index[0])
+            .to_dict()
+        ) if not analysis_df_for_name.empty else name_map
         lib = _build_kol_compare_lib(
             df_all_m=df_all_m,
-            collab_projects=active_projects,
+            collab_projects=analysis_projects,
             baseline_window_n=baseline_window_n,
             baseline_min_n=baseline_min_n,
-            name_map=name_map,
+            name_map=analysis_name_map,
             use_proxy_baseline=bool(use_proxy_baseline),
+            baseline_exclude_projects=baseline_exclude_projects,
         )
         if lib.empty:
             st.warning("没有生成KOL结果：请先补齐基准，或检查合作项目是否包含有效 owner_mid。")
         else:
+            st.caption(f"当前KOL对比表统计范围：{kol_view_scope}｜项目数：{len(analysis_projects)}｜KOL数：{len(lib)}")
             tab_visual, tab_table = st.tabs(["📍 KOL视觉总览", "📋 KOL对比表校对"])
             with tab_visual:
                 _render_kol_visuals(lib)
